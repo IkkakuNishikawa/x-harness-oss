@@ -12,6 +12,7 @@ import { users } from './routes/users.js';
 import { xAccounts } from './routes/x-accounts.js';
 import { processEngagementGates } from './services/engagement-gate.js';
 import { processScheduledPosts } from './services/post-scheduler.js';
+import { processScheduledArticles } from './services/article-scheduler.js';
 import { EngagementCache } from './services/reply-trigger-cache.js';
 import { stepSequences } from './routes/step-sequences.js';
 import { verify } from './routes/verify.js';
@@ -135,6 +136,23 @@ async function scheduled(
   const autoEnabled = await getSettingBool(env.DB, 'auto_features_enabled', false);
 
   const dbAccounts = await getXAccounts(env.DB);
+
+  // Explicitly approved Article schedules are independent from broad
+  // auto-features. They must run even when engagement automation is disabled.
+  const articleJobs: Promise<void>[] = [];
+  for (const account of dbAccounts) {
+    const xClient = account.consumer_key && account.consumer_secret && account.access_token_secret
+      ? new XClient({
+          type: 'oauth1',
+          consumerKey: account.consumer_key,
+          consumerSecret: account.consumer_secret,
+          accessToken: account.access_token,
+          accessTokenSecret: account.access_token_secret,
+        })
+      : new XClient(account.access_token);
+    articleJobs.push(processScheduledArticles(env.DB, xClient, account.id));
+  }
+  await Promise.allSettled(articleJobs);
 
   if (autoEnabled) {
     const jobs: Promise<void>[] = [];

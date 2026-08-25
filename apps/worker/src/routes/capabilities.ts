@@ -1,13 +1,14 @@
 import { Hono } from 'hono';
 import type { Env } from '../index.js';
 
-export const HARNESS_VERSION = '0.5.1';
-export const CONNECTOR_VERSION = '2026-05-20';
+export const HARNESS_VERSION = '0.6.0';
+export const CONNECTOR_VERSION = '2026-08-26';
 
 export const FEATURES = [
   'engagement-gates',
   'reply-trigger',
   'scheduled-posts',
+  'scheduled-articles',
   'step-sequences',
   'dm',
   'campaigns',
@@ -44,6 +45,7 @@ capabilities.get('/api/capabilities', (c) => {
         lineCampaignConfig: '/api/campaigns/line-config',
         dmConversations: '/api/dm/conversations',
         campaigns: '/api/campaigns',
+        scheduledArticles: '/api/articles/scheduled',
         setupStatus: '/setup',
       },
     },

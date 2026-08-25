@@ -16,7 +16,7 @@ export const articleToolDefs = [
   },
   {
     name: 'publish_article',
-    description: '下書きArticleを公開する。公開されたポストIDが返る',
+    description: '下書きArticleを今すぐ公開する。公開されたポストIDが返る。予約公開には schedule_article を使う',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -24,6 +24,43 @@ export const articleToolDefs = [
         articleId: { type: 'string', description: 'create_articleで返された記事ID' },
       },
       required: ['xAccountId', 'articleId'],
+    },
+  },
+  {
+    name: 'schedule_article',
+    description: '本人承認済みのX Article下書きをCloudflareへ予約登録する。登録後はPCの電源が切れていても指定時刻以降のCronで公開される',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        xAccountId: { type: 'string' },
+        articleId: { type: 'string', description: 'create_articleで返された記事ID' },
+        scheduledAt: { type: 'string', description: 'タイムゾーン付きISO 8601。JST例: 2026-08-27T18:00:00+09:00' },
+      },
+      required: ['xAccountId', 'articleId', 'scheduledAt'],
+    },
+  },
+  {
+    name: 'list_scheduled_articles',
+    description: 'X Articleの予約・公開・失敗履歴を一覧する',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        xAccountId: { type: 'string', description: '省略時は全アカウント' },
+        status: { type: 'string', enum: ['scheduled', 'publishing', 'published', 'failed', 'cancelled'] },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'cancel_scheduled_article',
+    description: 'まだ公開処理が始まっていないX Article予約を取り消す',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        xAccountId: { type: 'string' },
+        scheduleId: { type: 'string', description: 'schedule_articleで返された予約ID' },
+      },
+      required: ['xAccountId', 'scheduleId'],
     },
   },
   {

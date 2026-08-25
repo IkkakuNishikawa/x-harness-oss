@@ -83,6 +83,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'publish_article':
         result = await client.post(`/api/articles/${encodeURIComponent(a.articleId)}/publish`, { xAccountId: a.xAccountId });
         break;
+      case 'schedule_article':
+        result = await client.post(`/api/articles/${encodeURIComponent(a.articleId)}/schedule`, {
+          xAccountId: a.xAccountId,
+          scheduledAt: a.scheduledAt,
+        });
+        break;
+      case 'list_scheduled_articles': {
+        const params = new URLSearchParams();
+        if (a.xAccountId) params.set('xAccountId', a.xAccountId);
+        if (a.status) params.set('status', a.status);
+        const query = params.toString();
+        result = await client.get(`/api/articles/scheduled${query ? `?${query}` : ''}`);
+        break;
+      }
+      case 'cancel_scheduled_article':
+        result = await client.del(`/api/articles/scheduled/${encodeURIComponent(a.scheduleId)}?xAccountId=${encodeURIComponent(a.xAccountId)}`);
+        break;
       case 'search_news':
         result = await client.get(`/api/news/search?query=${encodeURIComponent(a.query)}${a.maxResults ? `&maxResults=${a.maxResults}` : ''}${a.xAccountId ? `&xAccountId=${encodeURIComponent(a.xAccountId)}` : ''}`);
         break;

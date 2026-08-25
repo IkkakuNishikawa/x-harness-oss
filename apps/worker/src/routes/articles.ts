@@ -1,7 +1,17 @@
 import { Hono } from 'hono';
 import { XClient, XApiRateLimitError } from '@x-harness/x-sdk';
 import type { ArticleContentState, ArticleContentBlock, ArticleEntity } from '@x-harness/x-sdk';
-import { getXAccountById, incrementApiUsage } from '@x-harness/db';
+import {
+  SCHEDULED_ARTICLE_STATUSES,
+  cancelScheduledArticle,
+  createScheduledArticle,
+  getActiveScheduledArticle,
+  getScheduledArticles,
+  getXAccountById,
+  incrementApiUsage,
+  toJstString,
+} from '@x-harness/db';
+import type { ScheduledArticleStatus } from '@x-harness/db';
 import type { Env } from '../index.js';
 
 const articles = new Hono<Env>();
@@ -387,6 +397,105 @@ articles.post('/api/articles/:id/publish', async (c) => {
   } catch (err: any) {
     return c.json({ success: false, error: errorMessage(err, 'Failed to publish article') }, 500);
   }
+});
+
+// POST /api/articles/:id/schedule — schedule final publication in Cloudflare.
+// Creating the Article draft and human approval happen before this endpoint.
+articles.post('/api/articles/:id/schedule', async (c) => {
+  const articleId = c.req.param('id');
+  const { xAccountId, scheduledAt } = await c.req.json<{
+    xAccountId: string;
+    scheduledAt: string;
+  }>();
+  if (!xAccountId || !scheduledAt) {
+    return c.json({ success: false, error: 'Missing required fields: xAccountId, scheduledAt' }, 400);
+  }
+  if (!/^\d+$/.test(articleId)) {
+    return c.json({ success: false, error: 'articleId must be numeric' }, 400);
+  }
+  if (!/Z$|[+-]\d{2}:\d{2}$/.test(scheduledAt)) {
+    return c.json({ success: false, error: 'scheduledAt must include a timezone offset (JST: +09:00)' }, 400);
+  }
+  const scheduledMs = new Date(scheduledAt).getTime();
+  if (Number.isNaN(scheduledMs)) {
+    return c.json({ success: false, error: 'scheduledAt must be a valid ISO 8601 datetime' }, 400);
+  }
+  if (scheduledMs < Date.now() + 60_000) {
+    return c.json({ success: false, error: 'scheduledAt must be at least 1 minute in the future' }, 400);
+  }
+
+  const account = await getXAccountById(c.env.DB, xAccountId);
+  if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
+
+  const existing = await getActiveScheduledArticle(c.env.DB, articleId);
+  if (existing) {
+    return c.json({ success: false, error: 'Article already has an active schedule', data: existing }, 409);
+  }
+
+  try {
+    const scheduled = await createScheduledArticle(
+      c.env.DB,
+      xAccountId,
+      articleId,
+      toJstString(new Date(scheduledMs)),
+    );
+    return c.json({
+      success: true,
+      data: {
+        id: scheduled.id,
+        xAccountId: scheduled.x_account_id,
+        articleId: scheduled.article_id,
+        scheduledAt: scheduled.scheduled_at,
+        status: scheduled.status,
+        createdAt: scheduled.created_at,
+      },
+    }, 201);
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error, 'Failed to schedule Article') }, 500);
+  }
+});
+
+// GET /api/articles/scheduled — list pending and historical Article schedules.
+articles.get('/api/articles/scheduled', async (c) => {
+  const xAccountId = c.req.query('xAccountId');
+  const statusParam = c.req.query('status');
+  const status = statusParam as ScheduledArticleStatus | undefined;
+  if (status && !SCHEDULED_ARTICLE_STATUSES.includes(status)) {
+    return c.json({ success: false, error: 'Invalid scheduled Article status' }, 400);
+  }
+  const items = await getScheduledArticles(c.env.DB, {
+    xAccountId: xAccountId ?? undefined,
+    status,
+  });
+  return c.json({
+    success: true,
+    data: items.map((item) => ({
+      id: item.id,
+      xAccountId: item.x_account_id,
+      articleId: item.article_id,
+      scheduledAt: item.scheduled_at,
+      status: item.status,
+      publishedPostId: item.published_post_id,
+      attempts: item.attempts,
+      lastError: item.last_error,
+      publishedAt: item.published_at,
+      createdAt: item.created_at,
+      updatedAt: item.updated_at,
+    })),
+  });
+});
+
+// DELETE /api/articles/scheduled/:scheduleId — cancel only a pending schedule.
+articles.delete('/api/articles/scheduled/:scheduleId', async (c) => {
+  const xAccountId = c.req.query('xAccountId');
+  if (!xAccountId) {
+    return c.json({ success: false, error: 'Missing required query param: xAccountId' }, 400);
+  }
+  const cancelled = await cancelScheduledArticle(c.env.DB, c.req.param('scheduleId'), xAccountId);
+  if (!cancelled) {
+    return c.json({ success: false, error: 'Pending Article schedule not found' }, 404);
+  }
+  return c.json({ success: true });
 });
 
 // GET /api/news/search?query=...&maxResults=10 — breaking news stories on X
