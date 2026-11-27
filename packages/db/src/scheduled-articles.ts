@@ -98,7 +98,7 @@ export async function getDueScheduledArticles(
   const result = await db
     .prepare(
       `SELECT * FROM scheduled_articles
-       WHERE status = 'scheduled' AND x_account_id = ? AND scheduled_at <= ?
+       WHERE status = 'scheduled' AND x_account_id = ? AND julianday(scheduled_at) <= julianday(?)
        ORDER BY scheduled_at ASC`,
     )
     .bind(xAccountId, now)

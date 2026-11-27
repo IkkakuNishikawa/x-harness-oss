@@ -62,8 +62,8 @@ export interface ArticleContentBlock {
 // data schemas per type (validator rejects additionalProperties):
 //   image → { caption?, url?, media_items: [{ media_id, media_category }] }
 //   post  → { post_id?, url?, entity_key? }   (embedded tweet)
-//   link  → { url }    markdown → { markdown }    emoji → { url }
-//   divider → {}
+//   link  → { url }    markdown → { markdown }    emoji → { entity_key } (docs; { url } also passed live)
+//   divider → {}    latex → {} (TeX source goes in the block text)
 export interface ArticleEntity {
   key: string;
   value: {
@@ -114,6 +114,8 @@ export interface XTweetSearchResult {
 export interface XTweetWithMetrics {
   id: string;
   text: string;
+  /** Present on long posts (>280): the full body; `text` is shortened. */
+  note_tweet?: { text?: string };
   author_id?: string;
   created_at?: string;
   public_metrics?: {

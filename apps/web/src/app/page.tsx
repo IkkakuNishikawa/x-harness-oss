@@ -1,4 +1,6 @@
 'use client'
+import SpendPanel from '@/components/spend-panel'
+import AiPanel from '@/components/ai-panel'
 
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
@@ -6,6 +8,8 @@ import { api } from '@/lib/api'
 import type { AccountStats, FollowerSnapshot } from '@/lib/api'
 import Header from '@/components/layout/header'
 import { useCurrentAccountId } from '@/hooks/use-selected-account'
+import { HarnessStatCard } from '@/components/ui/harness-ui'
+import HealthBanner from '@/components/health-banner'
 
 interface DashboardStats {
   activeGateCount: number | null
@@ -16,16 +20,6 @@ interface DashboardStats {
   monthlyRequests: number | null
   monthlyCost: number | null
   accountStats: AccountStats | null
-}
-
-interface StatCardProps {
-  title: string
-  value: number | null
-  loading: boolean
-  icon: React.ReactNode
-  href: string
-  accentColor: string
-  subtitle?: string
 }
 
 function MiniBarChart({ data }: { data: FollowerSnapshot[] }) {
@@ -61,40 +55,6 @@ function GrowthBadge({ value, label }: { value: number | null; label: string }) 
       <span className="text-gray-400">{label}</span>{' '}
       <span className={`font-semibold ${color}`}>{prefix}{value.toLocaleString('ja-JP')}</span>
     </span>
-  )
-}
-
-function StatCard({ title, value, loading, icon, href, accentColor, subtitle }: StatCardProps) {
-  return (
-    <Link
-      href={href}
-      className="block bg-white rounded-lg shadow-sm border border-gray-200 p-6 hover:shadow-md transition-shadow group"
-    >
-      <div className="flex items-start justify-between">
-        <div>
-          <p className="text-sm font-medium text-gray-500 mb-2">{title}</p>
-          {loading ? (
-            <div className="h-8 w-20 bg-gray-100 rounded animate-pulse" />
-          ) : (
-            <p className="text-3xl font-bold text-gray-900">
-              {value !== null ? value.toLocaleString('ja-JP') : '-'}
-            </p>
-          )}
-          {subtitle && !loading && (
-            <p className="text-xs text-gray-400 mt-1">{subtitle}</p>
-          )}
-        </div>
-        <div
-          className="w-10 h-10 rounded-lg flex items-center justify-center text-white shrink-0"
-          style={{ backgroundColor: accentColor }}
-        >
-          {icon}
-        </div>
-      </div>
-      <p className="text-xs text-gray-400 mt-3 group-hover:text-blue-600 transition-colors">
-        詳細を見る →
-      </p>
-    </Link>
   )
 }
 
@@ -185,7 +145,10 @@ export default function DashboardPage() {
 
   return (
     <div>
-      <Header title="ダッシュボード" description="X Harness の概要" />
+      <SpendPanel />
+      <AiPanel />
+      <Header title="ダッシュボード" description="X Harness の概要" product="X" />
+      <HealthBanner />
 
       {error && (
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
@@ -195,7 +158,7 @@ export default function DashboardPage() {
 
       {/* Stat cards grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-        <StatCard
+        <HarnessStatCard
           title="エンゲージメントゲート"
           value={stats.activeGateCount}
           loading={loading}
@@ -208,7 +171,7 @@ export default function DashboardPage() {
             </svg>
           }
         />
-        <StatCard
+        <HarnessStatCard
           title="フォロワー"
           value={stats.followerCount}
           loading={loading}
@@ -221,7 +184,7 @@ export default function DashboardPage() {
             </svg>
           }
         />
-        <StatCard
+        <HarnessStatCard
           title="タグ"
           value={stats.tagCount}
           loading={loading}
@@ -234,7 +197,7 @@ export default function DashboardPage() {
             </svg>
           }
         />
-        <StatCard
+        <HarnessStatCard
           title="予約投稿"
           value={stats.scheduledPostCount}
           loading={loading}
@@ -247,7 +210,7 @@ export default function DashboardPage() {
             </svg>
           }
         />
-        <StatCard
+        <HarnessStatCard
           title="スタッフ"
           value={stats.staffCount}
           loading={loading}
@@ -260,7 +223,7 @@ export default function DashboardPage() {
             </svg>
           }
         />
-        <StatCard
+        <HarnessStatCard
           title="今月のAPIリクエスト"
           value={stats.monthlyRequests}
           loading={loading}

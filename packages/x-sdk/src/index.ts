@@ -1,4 +1,4 @@
-export { XClient, XApiError, XApiRateLimitError } from './client.js';
+export { XClient, XApiError, XApiRateLimitError, withFullText } from './client.js';
 export { buildOAuth1Header } from './oauth1.js';
 export type { OAuth1Config } from './oauth1.js';
 export type {
@@ -19,3 +19,5 @@ export type {
   CreateArticleDraftParams,
   XNewsStory,
 } from './types.js';
+
+export type { RequestMeta, UsageEvent, XClientHooks } from "./client.js";

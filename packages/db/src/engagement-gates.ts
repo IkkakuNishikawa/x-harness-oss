@@ -1,6 +1,9 @@
 import { jstNow } from './utils.js';
 
 export interface DbEngagementGate {
+  delivery_method?: 'dm'|'reply_no_link'|'reply_with_link';
+  reply_templates?: string | null;
+  consecutive_empty_polls?: number;
   id: string;
   x_account_id: string;
   post_id: string;
@@ -91,7 +94,7 @@ export async function createEngagementGate(db: D1Database, input: CreateGateInpu
 }
 
 export async function getEngagementGates(db: D1Database, opts: { activeOnly?: boolean; xAccountId?: string } = {}): Promise<DbEngagementGate[]> {
-  const conditions: string[] = [];
+  const conditions: string[] = ['archived_at IS NULL'];
   const bindings: string[] = [];
   if (opts.activeOnly) {
     conditions.push('is_active = 1');
@@ -191,7 +194,7 @@ export async function updateEngagementGate(db: D1Database, id: string, updates: 
 }
 
 export async function deleteEngagementGate(db: D1Database, id: string): Promise<void> {
-  await db.prepare('DELETE FROM engagement_gates WHERE id = ?').bind(id).run();
+  await db.prepare("UPDATE engagement_gates SET is_active=0,gate_state='ended',archived_at=? WHERE id=?").bind(Date.now(),id).run();
 }
 
 export async function getDeliveries(db: D1Database, gateId: string, opts: { limit?: number; offset?: number } = {}): Promise<DbDelivery[]> {
@@ -215,11 +218,11 @@ export async function getDeliveredUserIds(db: D1Database, gateId: string): Promi
 
 export async function createDelivery(db: D1Database, gateId: string, xUserId: string, xUsername: string | null, deliveredPostId: string | null, status: string): Promise<DbDelivery> {
   const id = crypto.randomUUID();
-  const token = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  const token = Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');
   const now = jstNow();
   const result = await db
-    .prepare('INSERT INTO engagement_gate_deliveries (id, gate_id, x_user_id, x_username, delivered_post_id, status, token, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *')
-    .bind(id, gateId, xUserId, xUsername, deliveredPostId, status, token, now)
+    .prepare('INSERT INTO engagement_gate_deliveries (id, gate_id, x_user_id, x_username, delivered_post_id, status, token, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *')
+    .bind(id, gateId, xUserId, xUsername, deliveredPostId, status, token, now, new Date(Date.now()+14*86400000).toISOString())
     .first<DbDelivery>();
   return result!;
 }
@@ -259,7 +262,7 @@ export async function resolveToken(db: D1Database, token: string): Promise<Resol
   // and we return null — preventing double-redemption races.
   const now = jstNow();
   const row = await db
-    .prepare('UPDATE engagement_gate_deliveries SET consumed_at = ? WHERE token = ? AND consumed_at IS NULL RETURNING x_user_id, x_username, gate_id')
+    .prepare("UPDATE engagement_gate_deliveries SET consumed_at = ? WHERE token = ? AND consumed_at IS NULL AND (expires_at IS NULL OR julianday(expires_at)>julianday('now')) RETURNING x_user_id, x_username, gate_id")
     .bind(now, token)
     .first<{ x_user_id: string; x_username: string | null; gate_id: string }>();
   if (!row) return null;

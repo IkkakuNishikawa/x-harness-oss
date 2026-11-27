@@ -1,7 +1,7 @@
 'use client'
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { api } from '@/lib/api'
+import { API_URL } from '@/lib/api'
 
 export default function LoginPage() {
   const [apiKey, setApiKey] = useState('')
@@ -15,20 +15,21 @@ export default function LoginPage() {
     setError('')
 
     try {
-      // Temporarily store key so api.health() picks it up
-      localStorage.setItem('xh_api_key', apiKey)
-
-      const res = await api.health()
-
-      if (res.success) {
-        router.push('/')
-      } else {
-        localStorage.removeItem('xh_api_key')
-        setError('APIキーが正しくありません')
-      }
-    } catch {
       localStorage.removeItem('xh_api_key')
-      setError('接続に失敗しました')
+      const response = await fetch(`${API_URL}/api/auth/session`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiKey})})
+      if (response.status === 401 || response.status === 403) {
+        sessionStorage.removeItem('xh_session')
+        setError('APIキーが正しくありません')
+        return
+      }
+      const result = await response.json()
+      if (!response.ok || !result.success) throw new Error('Unauthorized')
+      sessionStorage.setItem('xh_session',result.data.token)
+      setApiKey('')
+      router.push('/')
+    } catch {
+      sessionStorage.removeItem('xh_session')
+      setError('接続に失敗しました。時間をおいて再度お試しください')
     } finally {
       setLoading(false)
     }

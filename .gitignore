@@ -10,3 +10,14 @@ out/
 packages/mcp/dist/
 .DS_Store
 .worktrees/
+
+node_modules
+.env*
+!.env.example
+
+.mcp.json
+.local/
+
+.x-harness-setup.json
+
+*.local.toml

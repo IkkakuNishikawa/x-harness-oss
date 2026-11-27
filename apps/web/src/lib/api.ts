@@ -2,7 +2,7 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8787
 
 export function getApiKey(): string {
   if (typeof window === 'undefined') return '';
-  return localStorage.getItem('xh_api_key') || '';
+  return sessionStorage.getItem('xh_session') || '';
 }
 
 export async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
@@ -14,6 +14,7 @@ export async function fetchApi<T>(path: string, options?: RequestInit): Promise<
       ...options?.headers,
     },
   });
+  if (res.status === 401 && typeof window !== 'undefined') { sessionStorage.removeItem('xh_session'); window.location.assign('/login'); }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { error?: string }).error || `HTTP ${res.status}`);
@@ -41,6 +42,8 @@ export interface EngagementGate {
   postId: string;
   triggerType: string;
   actionType: string;
+  deliveryMethod?: string;
+  replyTemplates?: string[];
   template: string;
   link: string | null;
   isActive: boolean;
@@ -100,7 +103,24 @@ export interface ScheduledPost {
   status: string;
   postedTweetId: string | null;
   createdAt: string;
+  // Failure tracking (worker migration 020); absent on older workers.
+  lastError?: string | null;
+  lastErrorStatus?: number | null;
+  lastErrorStage?: string | null;
+  attemptCount?: number;
+  quoteTweetId?: string | null;
+  replyToTweetId?: string | null;
 }
+
+export interface HealthDetails {
+  status: 'ok' | 'degraded' | 'down';
+  problems: string[];
+  scheduler?: { autoFeaturesEnabled: boolean; scheduledPostsPaused?: boolean; pausedReason?: string | null; cron: { lastStartedAt: string | null; lastFinishedAt: string | null; lastStatus: string | null; lastError: string | null } | null };
+  scheduledPosts?: { overdue: number; dueNow?: number; blockedByAutoFeaturesFlag?: number; claimedButUnrecorded?: number | null; last24h: Record<string, number>; totals: Record<string, number>; latestFailure: { id: string; lastError: string | null; failedAt: string } | null };
+  growthDrafts?: { pending: number | null };
+}
+
+export type ScheduledPostStatusFilter = 'scheduled' | 'failed' | 'posted' | 'all';
 
 export interface XAccount {
   id: string;
@@ -188,7 +208,7 @@ export interface DailyUsage { date: string; count: number; }
 
 export interface GateUsage {
   id: string; postId: string; triggerType: string;
-  apiCallsTotal: number; estimatedCost: number;
+  apiCallsTotal: number; estimatedCost: number; estimatedCostAvailable?: boolean;
 }
 
 
@@ -206,10 +226,13 @@ export interface NewsStory {
 export interface ArticleDraft {
   id: string;
   title: string;
+  // e.g. skipped inline images, over-long title
+  warnings?: string[];
 }
 
 export const api = {
   health: () => fetchApi<ApiResponse<{ status: string }>>('/api/health'),
+  healthDetails: () => fetchApi<ApiResponse<HealthDetails>>('/api/health/details'),
 
   engagementGates: {
     list: (params?: { xAccountId?: string }) => {
@@ -264,12 +287,24 @@ export const api = {
   },
 
   posts: {
-    schedule: (data: { xAccountId: string; text: string; scheduledAt: string }) =>
-      fetchApi<ApiResponse<ScheduledPost>>('/api/posts/schedule', { method: 'POST', body: JSON.stringify(data) }),
-    listScheduled: () => fetchApi<ApiResponse<ScheduledPost[]>>('/api/posts/scheduled'),
+    schedule: (data: { xAccountId: string; text: string; scheduledAt: string; replyToTweetId?: string; quoteTweetId?: string }) =>
+      fetchApi<ApiResponse<ScheduledPost> & { warnings?: string[] }>('/api/posts/schedule', { method: 'POST', body: JSON.stringify(data) }),
+    listScheduled: (status?: ScheduledPostStatusFilter) =>
+      fetchApi<ApiResponse<ScheduledPost[]>>(
+        // History views: newest 500 (the API maximum per page).
+        status && status !== 'scheduled' ? `/api/posts/scheduled?status=${status}&limit=500` : '/api/posts/scheduled',
+      ),
+    listScheduledPage: (params: { status: ScheduledPostStatusFilter; xAccountId?: string; limit: number; offset: number }) => {
+      const qs = new URLSearchParams({ status: params.status, limit: String(params.limit), offset: String(params.offset) });
+      if (params.xAccountId) qs.set('xAccountId', params.xAccountId);
+      return fetchApi<ApiResponse<ScheduledPost[]>>(`/api/posts/scheduled?${qs}`);
+    },
+    // confirmNotPosted: the operator checked on X that the failed post was not published.
+    requeue: (id: string, body: { confirmNotPosted: true; scheduledAt?: string }) =>
+      fetchApi<ApiResponse<ScheduledPost>>(`/api/posts/scheduled/${id}/requeue`, { method: 'POST', body: JSON.stringify(body) }),
     cancel: (id: string) => fetchApi<ApiResponse<void>>(`/api/posts/scheduled/${id}`, { method: 'DELETE' }),
-    create: (data: { xAccountId: string; text: string; quoteTweetId?: string; mediaIds?: string[] }) =>
-      fetchApi<ApiResponse<TweetHistory>>('/api/posts', { method: 'POST', body: JSON.stringify(data) }),
+    create: (data: { xAccountId: string; text: string; quoteTweetId?: string; replyToTweetId?: string; mediaIds?: string[] }) =>
+      fetchApi<ApiResponse<TweetHistory> & { warnings?: string[] }>('/api/posts', { method: 'POST', body: JSON.stringify(data) }),
     delete: (tweetId: string, xAccountId: string) =>
       fetchApi<ApiResponse<void>>(`/api/posts/${tweetId}?xAccountId=${encodeURIComponent(xAccountId)}`, { method: 'DELETE' }),
     thread: (data: { xAccountId: string; texts: string[]; mediaIds?: string[] }) =>
@@ -337,7 +372,8 @@ export const api = {
         headers: { Authorization: `Bearer ${getApiKey()}` },
         body: formData,
       });
-      if (!res.ok) {
+      if (res.status === 401 && typeof window !== 'undefined') { sessionStorage.removeItem('xh_session'); window.location.assign('/login'); }
+  if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error((body as { error?: string }).error || `Media upload failed: HTTP ${res.status}`);
       }

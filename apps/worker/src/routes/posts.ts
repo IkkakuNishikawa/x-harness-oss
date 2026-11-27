@@ -1,39 +1,36 @@
-import { Hono } from 'hono';
+import { buildXClient } from '../services/x-client.js';
+import { Hono, type Context } from 'hono';
 import { XClient } from '@x-harness/x-sdk';
-import { createScheduledPost, getScheduledPosts, deleteScheduledPost, getXAccountById, getXAccounts, incrementApiUsage, resolveFreeSlot, saveQuoteTweets, getQuoteTweetsByAccount, getQuoteTweetsBySource, getLatestDiscoveredAt, recordAction, getActions } from '@x-harness/db';
-import type { SaveQuoteTweetInput } from '@x-harness/db';
+import { createScheduledPost, getScheduledPosts, getScheduledPostById, requeueFailedScheduledPost, parseScheduledAtMs, toJstString, SCHEDULED_POST_STATUSES, deleteScheduledPost, getXAccountById, getXAccounts, incrementApiUsage, normalizeScheduledAt, resolveFreeSlot, saveQuoteTweets, getQuoteTweetsByAccount, getQuoteTweetsBySource, getLatestDiscoveredAt, recordAction, getActions } from '@x-harness/db';
+import type { DbScheduledPost, SaveQuoteTweetInput } from '@x-harness/db';
 import type { Env } from '../index.js';
+import { charLimitForPlan, checkTextLength, rememberPlan, tooLongResponseBody } from '../services/post-length.js';
 
 const posts = new Hono<Env>();
 
 // Helper: build XClient from account record
-function buildXClient(account: { consumer_key: string | null; consumer_secret: string | null; access_token: string; access_token_secret: string | null }): XClient {
-  return account.consumer_key && account.consumer_secret && account.access_token_secret
-    ? new XClient({
-        type: 'oauth1',
-        consumerKey: account.consumer_key,
-        consumerSecret: account.consumer_secret,
-        accessToken: account.access_token,
-        accessTokenSecret: account.access_token_secret,
-      })
-    : new XClient(account.access_token);
-}
 
 posts.post('/api/posts', async (c) => {
-  const { xAccountId, text, mediaIds, quoteTweetId, paidPartnership } = await c.req.json<{ xAccountId: string; text: string; mediaIds?: string[]; quoteTweetId?: string; paidPartnership?: boolean }>();
+  const { xAccountId, text, mediaIds, quoteTweetId, replyToTweetId, paidPartnership } = await c.req.json<{ xAccountId: string; text: string; mediaIds?: string[]; quoteTweetId?: string; replyToTweetId?: string; paidPartnership?: boolean }>();
   if (!text || !xAccountId) return c.json({ success: false, error: 'Missing required fields: xAccountId, text' }, 400);
+  if (replyToTweetId !== undefined && (typeof replyToTweetId !== 'string' || !/^\d{1,25}$/.test(replyToTweetId))) {
+    return c.json({ success: false, error: 'replyToTweetId must be a numeric post id' }, 400);
+  }
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
+  const length = await checkTextLength(c.env.DB, xClient, account.id, text);
+  if (!length.ok) return c.json(tooLongResponseBody(length), 400);
   try {
     const tweet = await xClient.createTweet({
       text,
       media: mediaIds ? { media_ids: mediaIds } : undefined,
       quote_tweet_id: quoteTweetId,
+      ...(replyToTweetId ? { reply: { in_reply_to_tweet_id: replyToTweetId } } : {}),
       ...(paidPartnership ? { paid_partnership: true } : {}),
     });
     c.executionCtx.waitUntil(incrementApiUsage(c.env.DB, account.id, 'create_tweet'));
-    return c.json({ success: true, data: tweet }, 201);
+    return c.json({ success: true, data: tweet, ...(length.warning ? { warnings: [length.warning] } : {}) }, 201);
   } catch (err: any) {
     return c.json({ success: false, error: err.message ?? 'Failed to create tweet' }, 500);
   }
@@ -48,9 +45,13 @@ posts.post('/api/posts/schedule', async (c) => {
   }
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
+  // Reject over-limit text now instead of letting the cron fail it later.
+  const length = await checkTextLength(c.env.DB, () => buildXClient(c.env, account, 'posts'), account.id, text);
+  if (!length.ok) return c.json(tooLongResponseBody(length), 400);
   // Avoid double-booking a slot already held by another scheduled post — two
   // posts due on the same cron tick fire simultaneously and read as a burst.
   // Past times are kept as-is (schedule-in-the-past means "post ASAP").
+  try { normalizeScheduledAt(scheduledAt); } catch { return c.json({ success: false, error: 'Invalid scheduledAt' }, 400); }
   const resolvedAt = await resolveFreeSlot(c.env.DB, xAccountId, scheduledAt);
   const post = await createScheduledPost(c.env.DB, xAccountId, text, resolvedAt, mediaIds, quoteTweetId);
   return c.json({
@@ -66,25 +67,117 @@ posts.post('/api/posts/schedule', async (c) => {
       postedTweetId: post.posted_tweet_id,
       createdAt: post.created_at,
     },
+    ...(length.warning ? { warnings: [length.warning] } : {}),
   }, 201);
 });
 
+// Response shape for scheduled posts (original fields + quoteTweetId/updatedAt).
+function serializeScheduledPost(p: DbScheduledPost) {
+  return {
+    id: p.id,
+    xAccountId: p.x_account_id,
+    text: p.text,
+    mediaIds: p.media_ids ? JSON.parse(p.media_ids) : null,
+    scheduledAt: p.scheduled_at,
+    status: p.status,
+    postedTweetId: p.posted_tweet_id,
+    createdAt: p.created_at,
+    quoteTweetId: p.quote_tweet_id ?? null,
+    updatedAt: p.updated_at,
+  };
+}
+
+const SCHEDULED_LIST_MAX_LIMIT = 500;
+const SCHEDULED_LIST_DEFAULT_LIMIT = 100;
+
+// GET /api/posts/scheduled?status=scheduled|posted|failed|all&xAccountId=&limit=&offset=
+// Without `status`/`limit`/`offset` it behaves exactly as before: every pending
+// ('scheduled') post, oldest slot first, unpaginated. Other statuses list
+// newest first and are paginated (default 100, max 500).
 posts.get('/api/posts/scheduled', async (c) => {
   const xAccountId = c.req.query('xAccountId');
-  const items = await getScheduledPosts(c.env.DB, { status: 'scheduled', xAccountId: xAccountId ?? undefined });
-  return c.json({
-    success: true,
-    data: items.map((p) => ({
-      id: p.id,
-      xAccountId: p.x_account_id,
-      text: p.text,
-      mediaIds: p.media_ids ? JSON.parse(p.media_ids) : null,
-      scheduledAt: p.scheduled_at,
-      status: p.status,
-      postedTweetId: p.posted_tweet_id,
-      createdAt: p.created_at,
-    })),
+  const statusParam = c.req.query('status') ?? 'scheduled';
+  if (statusParam !== 'all' && !(SCHEDULED_POST_STATUSES as readonly string[]).includes(statusParam)) {
+    return c.json({ success: false, error: `Invalid status. Use one of: ${[...SCHEDULED_POST_STATUSES, 'all'].join(', ')}` }, 400);
+  }
+  const limitParam = c.req.query('limit');
+  const offsetParam = c.req.query('offset');
+  const isLegacyQuery = statusParam === 'scheduled' && limitParam === undefined && offsetParam === undefined;
+  let limit: number | undefined;
+  let offset: number | undefined;
+  if (!isLegacyQuery) {
+    limit = limitParam === undefined ? SCHEDULED_LIST_DEFAULT_LIMIT : Number(limitParam);
+    offset = offsetParam === undefined ? 0 : Number(offsetParam);
+    if (!Number.isInteger(limit) || limit < 1 || limit > SCHEDULED_LIST_MAX_LIMIT || !Number.isInteger(offset) || offset < 0) {
+      return c.json({ success: false, error: `limit must be 1-${SCHEDULED_LIST_MAX_LIMIT} and offset >= 0` }, 400);
+    }
+  }
+  const items = await getScheduledPosts(c.env.DB, {
+    status: statusParam === 'all' ? undefined : statusParam,
+    xAccountId: xAccountId ?? undefined,
+    limit,
+    offset,
+    newestFirst: statusParam !== 'scheduled',
   });
+  return c.json({ success: true, data: items.map(serializeScheduledPost) });
+});
+
+// POST /api/posts/scheduled/:id/requeue — put a FAILED post back in the queue.
+// Body (optional): { scheduledAt, confirmNotPosted } — defaults to the post's
+// slot, rolled to the next free slot. Refuses posts X already accepted
+// (posted_tweet_id set); a post still holding its send claim (outcome unknown)
+// needs confirmNotPosted: true.
+posts.post('/api/posts/scheduled/:id/requeue', async (c) => {
+  const id = c.req.param('id');
+  const post = await getScheduledPostById(c.env.DB, id);
+  if (!post) return c.json({ success: false, error: 'Not found' }, 404);
+  if (post.status !== 'failed' || post.posted_tweet_id) {
+    return c.json({ success: false, error: 'Only failed posts that X never accepted can be requeued' }, 409);
+  }
+  // An empty body means "next free slot"; a non-empty body must be valid JSON.
+  let body: { scheduledAt?: unknown; confirmNotPosted?: unknown } = {};
+  const rawBody = (await c.req.text()).trim();
+  if (rawBody) {
+    try {
+      const parsed = JSON.parse(rawBody) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+      body = parsed as { scheduledAt?: unknown; confirmNotPosted?: unknown };
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400);
+    }
+  }
+  // A failed post that still holds its send claim may have reached X (the
+  // response was lost). Releasing it is an operator decision: they must
+  // confirm on X that the post is not there.
+  const claimed = await c.env.DB
+    .prepare('SELECT 1 AS held FROM scheduled_post_claims WHERE post_id = ?')
+    .bind(id)
+    .first<{ held: number }>();
+  if (claimed && body.confirmNotPosted !== true) {
+    return c.json({
+      success: false,
+      code: 'CONFIRM_NOT_POSTED_REQUIRED',
+      error: 'This post may have reached X. Check on X that it was not published, then retry with { "confirmNotPosted": true }',
+    }, 409);
+  }
+  let requested = post.scheduled_at;
+  if (body.scheduledAt !== undefined) {
+    const ms = typeof body.scheduledAt === 'string' ? parseScheduledAtMs(body.scheduledAt) : NaN;
+    if (Number.isNaN(ms)) {
+      return c.json({ success: false, error: 'scheduledAt must be YYYY-MM-DDTHH:MM:SS+09:00' }, 400);
+    }
+    requested = toJstString(new Date(ms));
+  }
+  const scheduledAt = await resolveFreeSlot(c.env.DB, post.x_account_id, requested, { rollStale: true });
+  const ok = await requeueFailedScheduledPost(c.env.DB, id, scheduledAt);
+  if (!ok) return c.json({ success: false, error: 'Post changed state; not requeued' }, 409);
+  // Keep an originating growth draft's slot in sync (the dashboard shows the draft's time).
+  await c.env.DB
+    .prepare('UPDATE growth_drafts SET scheduled_at = ?, updated_at = ? WHERE scheduled_post_id = ?')
+    .bind(scheduledAt, toJstString(new Date()), id)
+    .run();
+  const updated = await getScheduledPostById(c.env.DB, id);
+  return c.json({ success: true, data: updated ? serializeScheduledPost(updated) : { id, status: 'scheduled', scheduledAt } });
 });
 
 posts.delete('/api/posts/scheduled/:id', async (c) => {
@@ -124,7 +217,7 @@ posts.delete('/api/posts/:tweetId', async (c) => {
     }
   }
 
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   try {
     await xClient.deleteTweet(tweetId);
     c.executionCtx.waitUntil(incrementApiUsage(c.env.DB, account.id, 'delete_tweet'));
@@ -142,7 +235,12 @@ posts.post('/api/posts/thread', async (c) => {
   }
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
+  // Check every part before sending any: a half-posted thread can't be undone.
+  for (const [i, text] of texts.entries()) {
+    const length = await checkTextLength(c.env.DB, xClient, account.id, text);
+    if (!length.ok) return c.json({ ...tooLongResponseBody(length, { index: i }), error: `${i + 1}件目: ${length.error}` }, 400);
+  }
   try {
     const results: { id: string; text: string }[] = [];
     let previousId: string | undefined;
@@ -173,7 +271,7 @@ posts.get('/api/posts/search', async (c) => {
     account = accounts[0] || null;
   }
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   // Default LOW (10): pay-per-use bills per post returned ($0.005/post)
   const maxResultsParam = c.req.query('maxResults');
   const maxResults = maxResultsParam ? Math.min(Math.max(Number(maxResultsParam), 10), 100) : 10;
@@ -195,7 +293,7 @@ posts.get('/api/x-users/:username/tweets', async (c) => {
   const accounts = await getXAccounts(c.env.DB);
   const account = accounts[0] || null;
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   const limit = limitParam ? Math.min(Number(limitParam), 100) : 100;
   try {
     const userId = knownUserId ?? (await xClient.getUserByUsername(username)).id;
@@ -220,7 +318,7 @@ posts.get('/api/posts/history', async (c) => {
     account = accounts[0] || null;
   }
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   const limit = limitParam ? Math.min(Number(limitParam), 100) : 20;
   try {
     const res = await xClient.getUserTweets(account.x_user_id, limit, cursor ?? undefined);
@@ -244,7 +342,7 @@ posts.get('/api/posts/mentions', async (c) => {
     account = accounts[0] || null;
   }
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   try {
     const query = `to:${account.username} is:reply`;
     c.executionCtx.waitUntil(incrementApiUsage(c.env.DB, account.id, 'search_mentions'));
@@ -279,6 +377,7 @@ posts.get('/api/posts/mentions', async (c) => {
       };
       meta?: { next_token?: string };
     };
+    for(const post of raw.data ?? []) await c.env.DB.prepare('INSERT INTO post_cache(x_account_id,id,kind,json,fetched_at) VALUES (?,?,?,?,?) ON CONFLICT(x_account_id,id,kind) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at').bind(account.id,post.id,'mention',JSON.stringify(post),Date.now()).run();
     const usersMap = new Map<string, { username: string; name: string; profile_image_url?: string }>();
     for (const u of raw.includes?.users ?? []) {
       usersMap.set(u.id, { username: u.username, name: u.name, profile_image_url: u.profile_image_url });
@@ -387,7 +486,9 @@ posts.post('/api/posts/:id/reply', async (c) => {
   if (!xAccountId || !text) return c.json({ success: false, error: 'Missing required fields: xAccountId, text' }, 400);
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
+  const length = await checkTextLength(c.env.DB, xClient, account.id, text);
+  if (!length.ok) return c.json(tooLongResponseBody(length), 400);
   try {
     const tweet = await xClient.createTweet({ text, reply: { in_reply_to_tweet_id: tweetId } });
     c.executionCtx.waitUntil(recordAction(c.env.DB, { xAccountId, tweetId, actionType: 'reply' }));
@@ -402,19 +503,18 @@ posts.get('/api/x-accounts/:id/subscription', async (c) => {
   const xAccountId = c.req.param('id');
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   try {
     const user = await xClient.getMeWithSubscription();
-    const subscriptionType = user.subscription_type ?? 'None';
+    // 'Unknown' when X leaves the field out — the dashboard then defers the
+    // length decision to the send-time check instead of assuming 280.
+    const subscriptionType = user.subscription_type || 'Unknown';
     const verifiedType = user.verified_type ?? 'none';
-    // Character limits per subscription tier
-    const charLimitMap: Record<string, number> = {
-      None: 280,
-      Basic: 10000,
-      Premium: 10000,
-      PremiumPlus: 25000,
-    };
-    const charLimit = charLimitMap[subscriptionType] ?? 280;
+    // Character limit per subscription tier (every paid tier: 25,000).
+    const charLimit = charLimitForPlan(subscriptionType);
+    // Refresh the plan cache the send-time length check reads (only when X
+    // actually told us the plan).
+    if (user.subscription_type) c.executionCtx.waitUntil(rememberPlan(c.env.DB, account.id, user.subscription_type));
     return c.json({ success: true, data: { subscriptionType, verifiedType, charLimit } });
   } catch (err: any) {
     return c.json({ success: false, error: err.message ?? 'Failed to fetch subscription info' }, 500);
@@ -444,7 +544,7 @@ posts.post('/api/media/upload', async (c) => {
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
 
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   try {
     const mediaData = await file.arrayBuffer();
     const mediaCategory = (formData.get('mediaCategory') as string | null) ?? 'tweet_image';
@@ -463,7 +563,7 @@ posts.post('/api/posts/:id/like', async (c) => {
   if (!xAccountId) return c.json({ success: false, error: 'Missing required field: xAccountId' }, 400);
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   try {
     await xClient.likeTweet(account.x_user_id, tweetId);
     c.executionCtx.waitUntil(incrementApiUsage(c.env.DB, account.id, 'like_tweet'));
@@ -481,7 +581,7 @@ posts.post('/api/posts/:id/retweet', async (c) => {
   if (!xAccountId) return c.json({ success: false, error: 'Missing required field: xAccountId' }, 400);
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
   try {
     await xClient.retweet(account.x_user_id, tweetId);
     c.executionCtx.waitUntil(incrementApiUsage(c.env.DB, account.id, 'retweet'));
@@ -504,7 +604,7 @@ posts.get('/api/posts/:id/quotes', async (c) => {
     account = accounts[0] || null;
   }
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
 
   // Fetch from DB first
   const dbQuotes = await getQuoteTweetsBySource(c.env.DB, tweetId);
@@ -536,6 +636,7 @@ posts.get('/api/posts/:id/quotes', async (c) => {
       };
       meta?: { next_token?: string };
     };
+    for(const post of raw.data ?? []) await c.env.DB.prepare('INSERT INTO post_cache(x_account_id,id,kind,json,fetched_at) VALUES (?,?,?,?,?) ON CONFLICT(x_account_id,id,kind) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at').bind(account.id,post.id,'mention',JSON.stringify(post),Date.now()).run();
     const usersMap = new Map<string, { username: string; name: string; profile_image_url?: string }>();
     for (const u of raw.includes?.users ?? []) {
       usersMap.set(u.id, { username: u.username, name: u.name, profile_image_url: u.profile_image_url });
@@ -630,7 +731,7 @@ posts.post('/api/quotes/sync', async (c) => {
   if (!xAccountId) return c.json({ success: false, error: 'Missing xAccountId' }, 400);
   const account = await getXAccountById(c.env.DB, xAccountId);
   if (!account) return c.json({ success: false, error: 'X account not found' }, 404);
-  const xClient = buildXClient(account);
+  const xClient = await buildXClient(c.env, account, 'posts');
 
   try {
     // Get recent tweets
@@ -645,7 +746,8 @@ posts.post('/api/quotes/sync', async (c) => {
           data: Array<{ id: string; text: string; author_id: string; created_at?: string }>;
           includes?: { users?: Array<{ id: string; username: string; name: string; profile_image_url?: string }> };
         };
-        const usersMap = new Map<string, { username: string; name: string; profile_image_url?: string }>();
+        for(const post of raw.data ?? []) await c.env.DB.prepare('INSERT INTO post_cache(x_account_id,id,kind,json,fetched_at) VALUES (?,?,?,?,?) ON CONFLICT(x_account_id,id,kind) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at').bind(account.id,post.id,'mention',JSON.stringify(post),Date.now()).run();
+    const usersMap = new Map<string, { username: string; name: string; profile_image_url?: string }>();
         for (const u of raw.includes?.users ?? []) {
           usersMap.set(u.id, { username: u.username, name: u.name, profile_image_url: u.profile_image_url });
         }
@@ -678,5 +780,22 @@ posts.post('/api/quotes/sync', async (c) => {
     return c.json({ success: false, error: err.message ?? 'Failed to sync quotes' }, 500);
   }
 });
+
+async function readPost(c: Context<Env>, metricsOnly: boolean) {
+  const id = c.req.param('id') ?? '';
+  if (!/^\d{1,25}$/.test(id)) return c.json({ success: false, error: 'Invalid post ID' }, 400);
+  const accountId = c.req.query('xAccountId');
+  const accounts = accountId ? [] : await getXAccounts(c.env.DB);
+  if (!accountId && accounts.length > 1) return c.json({ success: false, error: 'xAccountId required for multiple accounts' }, 400);
+  const account = accountId ? await getXAccountById(c.env.DB, accountId) : accounts[0];
+  if (!account || !account.is_active) return c.json({ success: false, error: 'X account not found' }, 404);
+  const client = await buildXClient(c.env, account, 'post-lookup');
+  const tweet = await client.getTweet(id);
+  return c.json({ success: true, data: metricsOnly ? tweet.public_metrics ?? {} : tweet });
+}
+
+// Keep these after named collection routes such as /history and /scheduled.
+posts.get('/api/posts/:id/metrics', c => readPost(c, true));
+posts.get('/api/posts/:id', c => readPost(c, false));
 
 export { posts };

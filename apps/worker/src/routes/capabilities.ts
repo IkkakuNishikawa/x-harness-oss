@@ -1,8 +1,9 @@
+import { APP_VERSION } from '@x-harness/shared';
 import { Hono } from 'hono';
 import type { Env } from '../index.js';
 
-export const HARNESS_VERSION = '0.6.0';
-export const CONNECTOR_VERSION = '2026-08-26';
+export const HARNESS_VERSION = APP_VERSION;
+export const CONNECTOR_VERSION = '2026-11-27';
 
 export const FEATURES = [
   'engagement-gates',

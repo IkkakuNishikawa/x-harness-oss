@@ -2,10 +2,10 @@ import { XClient, XApiRateLimitError } from '@x-harness/x-sdk';
 import type { XUser, XApiResponse } from '@x-harness/x-sdk';
 import {
   getEngagementGates, getDeliveredUserIds, createDelivery, updateDeliveryStatus,
-  upsertFollower, updateEngagementGate, updateGateSinceId, incrementApiUsage,
+  decryptSecret, upsertFollower, updateEngagementGate, updateGateSinceId, incrementApiUsage,
 } from '@x-harness/db';
 import type { DbEngagementGate } from '@x-harness/db';
-import { addJitter, varyTemplate, checkRateLimit, incrementRateLimit } from './stealth.js';
+import { varyTemplate, checkRateLimit } from './stealth.js';
 import { shouldPollNow, isExpired, calculateNextPollAt } from './polling-scheduler.js';
 import { EngagementCache, fetchNewReplies, checkConditions } from './reply-trigger-cache.js';
 
@@ -15,13 +15,19 @@ import { EngagementCache, fetchNewReplies, checkConditions } from './reply-trigg
  */
 export async function processEngagementGates(
   db: D1Database, xClient: XClient, xAccountId?: string, forceRun = false,
-  cache?: EngagementCache,
+  cache?: EngagementCache, encryptionKey?: string,
 ): Promise<void> {
-  const sharedCache = cache ?? new EngagementCache();
+  const sharedCache = cache ?? new EngagementCache(undefined,db);
   const allGates = await getEngagementGates(db, { activeOnly: true });
   const gates = xAccountId ? allGates.filter((g) => g.x_account_id === xAccountId) : allGates;
 
   for (const gate of gates) {
+    if((gate as any).gate_mode==='line_first')continue;
+    if(gate.action_type==='dm'||gate.delivery_method==='dm'||gate.action_type==='mention_post'&&(gate.trigger_type!=='reply'||!!gate.link)){
+      await db.prepare("UPDATE engagement_gates SET is_active=0,pause_reason='legacy_delivery_requires_migration' WHERE id=?").bind(gate.id).run();
+      continue;
+    }
+    if(gate.line_harness_api_key) gate.line_harness_api_key=await decryptSecret(gate.line_harness_api_key,encryptionKey);
     try {
       // Check expiry first
       if (isExpired(gate)) {
@@ -55,7 +61,8 @@ export async function processEngagementGates(
         console.error(`Error processing gate ${gate.id}:`, pollErr);
       } finally {
         // Manual gates should keep next_poll_at null after force-run
-        const nextPollAt = gate.polling_strategy === 'manual' ? null : calculateNextPollAt(gate);
+        const counter=await db.prepare('SELECT consecutive_empty_polls FROM engagement_gates WHERE id=?').bind(gate.id).first<{consecutive_empty_polls:number}>();
+        const nextPollAt = gate.polling_strategy === 'manual' ? null : calculateNextPollAt({...gate,consecutive_empty_polls:counter?.consecutive_empty_polls ?? 0});
         const now = new Date().toISOString();
         if (pollSucceeded) {
           await db
@@ -92,7 +99,7 @@ async function processOneGate(
   if (gate.action_type === 'verify_only') return;
 
   // Reply-trigger mode: reply is the trigger, like/repost/follow are verification conditions
-  if (gate.trigger_type === 'reply' && (gate.require_like || gate.require_repost || gate.require_follow)) {
+  if (gate.trigger_type === 'reply') {
     await processReplyTriggerGate(db, xClient, gate, cache);
     return;
   }
@@ -121,12 +128,12 @@ async function processOneGate(
   const newUsers = engagedUsers.data.filter((u) => !deliveredIds.has(u.id));
 
   for (const user of newUsers) {
-    if (!checkRateLimit(gate.x_account_id)) {
+    if (!await checkRateLimit(db, gate.x_account_id)) {
       console.log(`Rate limit reached for account ${gate.x_account_id}, pausing`);
       return;
     }
 
-    await addJitter(30_000, 180_000);
+
 
     // Create pending delivery first to get the token
     const delivery = await createDelivery(db, gate.id, user.id, user.username, null, 'pending');
@@ -136,34 +143,23 @@ async function processOneGate(
       if (gate.lottery_enabled) {
         const won = Math.random() * 100 < gate.lottery_rate;
         if (!won) {
-          if (gate.lottery_lose_template) {
-            const loseText = varyTemplate(gate.lottery_lose_template.replace('{username}', user.username));
-            await xClient.createTweet({ text: `@${user.username} ${loseText}` });
-          }
           await updateDeliveryStatus(db, delivery.id, 'delivered');
-          incrementRateLimit(gate.x_account_id);
           continue;
         }
       }
 
-      const winTemplate = (gate.lottery_enabled && gate.lottery_win_template) ? gate.lottery_win_template : gate.template;
-      let text = varyTemplate(winTemplate.replace('{username}', user.username));
+      const winTemplate = (gate.lottery_enabled && gate.lottery_win_template) ? gate.lottery_win_template : varyTemplate(gate.template,gate.reply_templates?JSON.parse(gate.reply_templates):undefined);
+      let text = varyTemplate(winTemplate.replaceAll('{username}', user.username));
       if (gate.link) {
         // Build link with one-time token for X-LINE account linking
         const personalizedLink = appendRef(gate.link, `xh:${delivery.token}`);
-        text = text.replace('{link}', personalizedLink);
+        text = text.replaceAll('{link}', personalizedLink);
       }
 
+      text = text.replaceAll('{link}', '');
       let tweetId: string;
-      if (gate.action_type === 'dm') {
-        await xClient.sendDm(user.id, text);
-        tweetId = 'dm';
-      } else {
-        const tweet = await xClient.createTweet({ text: `@${user.username} ${text}` });
-        tweetId = tweet.id;
-      }
+      tweetId = await deliverGate(xClient,gate,user.id,user.username,text);
       await updateDeliveryStatus(db, delivery.id, 'delivered', tweetId);
-      incrementRateLimit(gate.x_account_id);
 
       await upsertFollower(db, {
         xAccountId: gate.x_account_id,
@@ -175,9 +171,6 @@ async function processOneGate(
         followingCount: user.public_metrics?.following_count,
       });
 
-      if (gate.line_harness_url && gate.line_harness_api_key) {
-        triggerLineHarness(gate.line_harness_url, gate.line_harness_api_key, gate.line_harness_tag, gate.line_harness_scenario_id, user.username).catch(() => {});
-      }
     } catch (err) {
       if (err instanceof XApiRateLimitError) {
         // Mark pending delivery as failed before re-throwing to prevent permanent suppression
@@ -193,7 +186,7 @@ async function processOneGate(
 async function processVerifyOnlyGate(
   db: D1Database, xClient: XClient, gate: DbEngagementGate, cache: EngagementCache,
 ): Promise<void> {
-  const { users: replyUsers, newestId } = await fetchNewReplies(xClient, gate);
+  const { users: replyUsers, newestId } = await fetchNewReplies(xClient, gate, 10, db);
   if (replyUsers.length === 0) return;
 
   const deliveredIds = await getDeliveredUserIds(db, gate.id);
@@ -227,13 +220,14 @@ async function processVerifyOnlyGate(
 
   if (newestId) {
     await updateGateSinceId(db, gate.id, newestId);
+    await db.prepare(`DELETE FROM reply_trigger_queue WHERE gate_id=? AND json_extract(json,'$.id') IN (SELECT x_user_id FROM engagement_gate_deliveries WHERE gate_id=? AND status='delivered')`).bind(gate.id,gate.id).run();
   }
 }
 
 async function processReplyTriggerGate(
   db: D1Database, xClient: XClient, gate: DbEngagementGate, cache: EngagementCache,
 ): Promise<void> {
-  const { users: replyUsers, newestId } = await fetchNewReplies(xClient, gate);
+  const { users: replyUsers, newestId } = await fetchNewReplies(xClient, gate, 10, db);
   if (replyUsers.length === 0) return;
 
   const deliveredIds = await getDeliveredUserIds(db, gate.id);
@@ -251,12 +245,12 @@ async function processReplyTriggerGate(
     const allMet = conditions.like && conditions.repost && conditions.follow;
     if (!allMet) continue;
 
-    if (!checkRateLimit(gate.x_account_id)) {
+    if (!await checkRateLimit(db, gate.x_account_id)) {
       console.log(`Rate limit reached for account ${gate.x_account_id}, pausing`);
       return;
     }
 
-    await addJitter(30_000, 180_000);
+
 
     const delivery = await createDelivery(db, gate.id, user.id, user.username, null, 'pending');
 
@@ -265,30 +259,20 @@ async function processReplyTriggerGate(
       if (gate.lottery_enabled) {
         const won = Math.random() * 100 < gate.lottery_rate;
         if (!won) {
-          if (gate.lottery_lose_template) {
-            const loseText = varyTemplate(gate.lottery_lose_template.replace('{username}', user.username));
-            await xClient.createTweet({ text: `@${user.username} ${loseText}` });
-          }
           await updateDeliveryStatus(db, delivery.id, 'delivered');
-          incrementRateLimit(gate.x_account_id);
           continue;
         }
       }
 
-      const winTemplate = (gate.lottery_enabled && gate.lottery_win_template) ? gate.lottery_win_template : gate.template;
-      let text = varyTemplate(winTemplate.replace('{username}', user.username));
+      const winTemplate = (gate.lottery_enabled && gate.lottery_win_template) ? gate.lottery_win_template : varyTemplate(gate.template,gate.reply_templates?JSON.parse(gate.reply_templates):undefined);
+      let text = varyTemplate(winTemplate.replaceAll('{username}', user.username));
       if (gate.link) {
         const personalizedLink = appendRef(gate.link, `xh:${delivery.token}`);
-        text = text.replace('{link}', personalizedLink);
+        text = text.replaceAll('{link}', personalizedLink);
       }
 
-      if (gate.action_type === 'dm') {
-        await xClient.sendDm(user.id, text);
-      } else {
-        await xClient.createTweet({ text: `@${user.username} ${text}` });
-      }
+      await deliverGate(xClient,gate,user.id,user.username,text.replaceAll('{link}',''));
       await updateDeliveryStatus(db, delivery.id, 'delivered');
-      incrementRateLimit(gate.x_account_id);
 
       await upsertFollower(db, {
         xAccountId: gate.x_account_id,
@@ -300,9 +284,6 @@ async function processReplyTriggerGate(
         followingCount: user.publicMetrics?.following_count,
       });
 
-      if (gate.line_harness_url && gate.line_harness_api_key) {
-        triggerLineHarness(gate.line_harness_url, gate.line_harness_api_key, gate.line_harness_tag, gate.line_harness_scenario_id, user.username).catch(() => {});
-      }
     } catch (err) {
       if (err instanceof XApiRateLimitError) {
         await updateDeliveryStatus(db, delivery.id, 'failed').catch(() => {});
@@ -317,6 +298,7 @@ async function processReplyTriggerGate(
   // the loop bailed on rate limit or error, those replies would be permanently skipped.
   if (newestId) {
     await updateGateSinceId(db, gate.id, newestId);
+    await db.prepare(`DELETE FROM reply_trigger_queue WHERE gate_id=? AND json_extract(json,'$.id') IN (SELECT x_user_id FROM engagement_gate_deliveries WHERE gate_id=? AND status='delivered')`).bind(gate.id,gate.id).run();
   }
 }
 
@@ -393,14 +375,17 @@ function appendRef(link: string, ref: string): string {
   }
 }
 
-async function triggerLineHarness(
-  apiUrl: string, apiKey: string, tag: string | null, scenarioId: string | null, xUsername: string,
-): Promise<void> {
-  if (tag) {
-    await fetch(`${apiUrl}/api/friends/tag-by-metadata`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ metadataKey: 'x_username', metadataValue: xUsername, tagName: tag }),
-    });
+export async function deliverGate(client:XClient,gate:DbEngagementGate,id:string,username:string,text:string):Promise<string> {
+  if(gate.link && gate.action_type==='mention_post')throw new Error('Public reward-token links are disabled');
+  const method=gate.delivery_method ?? (gate.action_type==='dm'?'dm':'reply_with_link');
+  if(method==='dm') {
+    try {await client.sendDm(id,text);return 'dm';}
+    catch(err) {
+      // A refusal is recorded as a failure by the caller; never expose it publicly.
+      if(!(err instanceof Error) || !('status' in err) || err.status!==403) throw err;
+      throw new Error('skipped_dm_refused');
+    }
   }
+  if(method!=='reply_with_link') text=text.replace(/https?:\/\/\S+/gi,'').trim();
+  const result=await client.createTweet({text:`@${username} ${text}`});return result.id;
 }

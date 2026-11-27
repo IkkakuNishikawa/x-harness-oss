@@ -1,3 +1,26 @@
+## アップデート情報
+
+- **v0.10.0（2026-10-28）** — 返信キャンペーン向けの外部X観測（External observations）。オーナー接続のXリーダーが収集した原文・投稿者情報を、明示的に有効化したキャンペーンへ渡せる。migration 023（2テーブル追加）。[セットアップとプロトコル](docs/operations/external-observations.md)
+- **v0.10.0 同梱の更新** — 記事の本文をX公式記事の content_state に変換して下書き化、Premium各階層で25,000文字の長文ポストに対応、ダッシュボードUI（承認キュー・投稿キュー・ナビゲーション・記事）を生産版と同期
+- **v0.9.0 / v0.7.x** — X-to-LINEキャンペーンの改善・サマリーとコスト管理、LINE先行キャンペーン（合言葉ゲート: LINEで本人確認して個人用合言葉を発行し、Xの投稿者から照合。X ID入力は不要）。[移行ガイド](docs/operations/line-first-gates.md)
+- 更新は必ず[リリースノート](docs/releases/)と移行ガイドを先に読み、DB migration・GATE_CLAIMS（Durable Object）バインディングなどの要件を確認してから行ってください。既存データベースへの再適用や fresh baseline の上書きはしないでください。
+
+Release notes: [v0.10.0](docs/releases/v0.10.0.md). Maintainers: [release procedure](docs/RELEASING.md).
+
+This is a GitHub source release. npm publishing is separate; `npx create-x-harness@latest` may still use the preceding npm release.
+
+
+Read [the upgrade and validation guide](docs/operations/audit-20261026.md) before deploying over an existing database. Fresh installations use `packages/db/bootstrap`; historical installations must audit their actual schema before applying migration 019. Do not reapply historical ALTER migrations or run the fresh baseline on a populated database.
+
+- `ENCRYPTION_KEY` is a required base64-encoded 32-byte key for new credential writes. Keep it stable across deployments. Existing secrets have an explicit, bounded migration command.
+- `ADMIN_ORIGIN` lists exact dashboard origins. Dashboard login exchanges the master/staff key for a 12-hour session; it never saves the master key.
+- Admin: settings, credentials, connections, staff, webhook administration, budgets. Editor: posts, gates, AI drafts/research. Viewer: reads. `/api/staff/me` is available to all authenticated roles. Public user search requires an active `gateId`; CRM search and replier lists require authentication.
+- Optional `XAI_API_KEY` enables Grok; default model is `grok-4.3`, AI budget $5/month. X API application guard defaults to $50/month. These are application stopping thresholds, not a guarantee about in-flight/provider charges; also configure provider spending limits. Prices are configurable estimates, not invoice reconciliation.
+- A scheduled post runs independently of optional discovery automation. A persistent claim prevents overlapping cron jobs from sending it twice; ambiguous failures require manual reconciliation.
+- New delivery choices default to DM. Existing campaigns keep their delivery method. No duplicate-detection evasion is performed.
+- AI outputs are drafts/analyses; they do not post or send messages. Daily digest is opt-in at 08:00 JST. Without Grok, research is a bounded X API search; other features use stored data or rules.
+- Scraper installation requires `--enable-scraper`; MCP scraper tools additionally require `X_HARNESS_ENABLE_SCRAPER=true`. `ai_research` is the default research alternative.
+
 # X Harness
 
 <p align="center">
@@ -7,7 +30,9 @@
 </p>
 
 X（旧Twitter）向けオープンソースマーケティングオートメーション。
-Xステップ・SocialDog の代替として、無料（または低コスト）で運用できます。
+X Harness本体のソフトウェア利用料は **0円** です。X APIの利用料、Cloudflareの契約・利用量、独自ドメイン、導入・保守、接続する外部AIサービスの費用は別です。
+
+費用の条件は[開発元の公式料金説明](https://the-harness.com/x-harness/#costs)で確認できます。[Cloudflare D1の無料プラン](https://developers.cloudflare.com/d1/platform/pricing/)は日次の読み書き上限に達するとクエリがエラーになり、有料プランの超過課金とは挙動が異なります。外部AIを接続する場合は、たとえば[Claudeのプラン・API料金](https://claude.com/pricing)を別に確認してください（2026年9月6日確認）。
 
 ## 公式情報・検証資料
 
@@ -31,7 +56,7 @@ X Harnessの製品名、開発者、運営法人、公開コード、研究資�
 ## 機能
 
 - **エンゲージメントゲート** — リプライ + いいね/リポスト/フォロー条件でLINE連携・verify API
-- **キャンペーンウィザード** — 投稿→条件→LINE連携→プレビューの4ステップで一括設定
+- **LINE先行キャンペーン** — 合言葉による参加確認、先着・抽選・参加賞を設定
 - **投稿管理** — テキスト・画像・動画投稿、スレッド作成、スケジュール投稿
 - **リプライ管理** — 受信リプライの確認、ワンクリックいいね/リポスト、返信、自分のリプライ表示
 - **引用ツイート** — 引用RT自動検出、DB永続化、引用RTで返しアクション
@@ -56,7 +81,7 @@ X Harnessの製品名、開発者、運営法人、公開コード、研究資�
 
 | 機能 | X Harness | Xステ◯プ | S◯cialD◯g |
 |------|-----------|-----------|-----------|
-| 月額料金 | **$0** | ¥21,780〜 | ¥1,980〜 |
+| 月額料金 | **0円（ソフトウェア利用料）** | ¥21,780〜 | ¥1,980〜 |
 | エンゲージメントゲート | ✅ | ✅ | ❌ |
 | キャンペーンウィザード | ✅ | ❌ | ❌ |
 | LINE連携 | ✅ | ❌ | ❌ |
@@ -236,7 +261,7 @@ twitter-cli が PATH 外にある場合は `TWITTER_BIN` でフルパスを指�
 
 ### 前提条件
 
-- Node.js 20+
+- Node.js 22.13+
 - pnpm 9+
 - [Cloudflare アカウント](https://dash.cloudflare.com/sign-up)
 - [X Developer アカウント](https://developer.x.com/) (Pay-Per-Use 推奨)
@@ -335,7 +360,7 @@ x-harness/
 |---------|-----------|
 | ゲート1-2個（通常運用） | **$3-5** |
 | バズ投稿（5,000+いいね） | $20-45 |
-| インフラ (CF Free) | **$0** |
+| インフラ (CF Free) | **$0（無料枠内）** |
 
 X API Pay-Per-Use プラン推奨。リプライトリガーアーキテクチャにより、`since_id` 差分取得でAPIコールを最小化。
 
@@ -343,23 +368,9 @@ X API Pay-Per-Use プラン推奨。リプライトリガーアーキテクチ�
 
 ## L Harness 連携
 
-X Harness はクロスプラットフォームキャンペーンのための verify API を提供:
+新規キャンペーンは `POST /api/campaigns` の `mode: line_first` を使います。LINEで認証した参加者へ専用の合言葉を発行し、X投稿の `author_id` を検証して結果をLINEへ返します。共有キーによる署名、再送・重複排除、アカウントの固定が必須です。参加者にXのIDを自己申告させる旧フォームは新規利用しません。
 
-```
-GET /api/engagement-gates/:id/verify?username=johndoe
-
-{
-  "eligible": true,
-  "conditions": {
-    "reply": true,
-    "like": true,
-    "repost": true,
-    "follow": true
-  }
-}
-```
-
-キャンペーンウィザードを使えば、L Harness のフォーム作成・リンク生成まで自動化されます。
+[LINE連携の設定・移行ガイド](docs/operations/line-first-gates.md)を参照してください。
 
 ## ライセンス
 

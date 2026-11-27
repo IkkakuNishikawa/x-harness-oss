@@ -20,6 +20,8 @@ vi.mock('@x-harness/db', async (importOriginal) => ({
 import { XApiRateLimitError } from '@x-harness/x-sdk';
 import { processScheduledArticles } from '../article-scheduler.js';
 
+const db = { prepare: vi.fn(() => ({ bind: vi.fn(() => ({ run: vi.fn(async () => ({})) })) })) };
+
 const dueArticle = {
   id: 'schedule-1',
   x_account_id: 'account-1',
@@ -37,6 +39,7 @@ const dueArticle = {
 describe('processScheduledArticles', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    incrementApiUsageMock.mockResolvedValue(undefined);
     getDueScheduledArticlesMock.mockResolvedValue([dueArticle]);
     claimScheduledArticleMock.mockResolvedValue({ ...dueArticle, status: 'publishing', attempts: 1 });
   });
@@ -46,24 +49,24 @@ describe('processScheduledArticles', () => {
       publishArticle: vi.fn(async () => ({ post_id: '2100000000000000000' })),
     } as any;
 
-    await processScheduledArticles({} as any, xClient, 'account-1');
+    await processScheduledArticles(db as any, xClient, 'account-1');
 
-    expect(claimScheduledArticleMock).toHaveBeenCalledWith({}, 'schedule-1');
+    expect(claimScheduledArticleMock).toHaveBeenCalledWith(db, 'schedule-1');
     expect(xClient.publishArticle).toHaveBeenCalledOnce();
     expect(xClient.publishArticle).toHaveBeenCalledWith('2099999999999999999');
     expect(markScheduledArticlePublishedMock).toHaveBeenCalledWith(
-      {},
+      db,
       'schedule-1',
       '2100000000000000000',
     );
-    expect(incrementApiUsageMock).toHaveBeenCalledWith({}, 'account-1', 'article_publish');
+    expect(incrementApiUsageMock).toHaveBeenCalledWith(db, 'account-1', 'article_publish');
   });
 
   it('does not publish when another Cron invocation already claimed the row', async () => {
     claimScheduledArticleMock.mockResolvedValueOnce(null);
     const xClient = { publishArticle: vi.fn() } as any;
 
-    await processScheduledArticles({} as any, xClient, 'account-1');
+    await processScheduledArticles(db as any, xClient, 'account-1');
 
     expect(xClient.publishArticle).not.toHaveBeenCalled();
   });
@@ -75,9 +78,9 @@ describe('processScheduledArticles', () => {
       }),
     } as any;
 
-    await processScheduledArticles({} as any, xClient, 'account-1');
+    await processScheduledArticles(db as any, xClient, 'account-1');
 
-    expect(releaseScheduledArticleMock).toHaveBeenCalledWith({}, 'schedule-1', 'Rate limited by X API');
+    expect(releaseScheduledArticleMock).toHaveBeenCalledWith(db, 'schedule-1', 'Rate limited by X API');
     expect(markScheduledArticleFailedMock).not.toHaveBeenCalled();
   });
 
@@ -88,13 +91,32 @@ describe('processScheduledArticles', () => {
       }),
     } as any;
 
-    await processScheduledArticles({} as any, xClient, 'account-1');
+    await processScheduledArticles(db as any, xClient, 'account-1');
 
     expect(markScheduledArticleFailedMock).toHaveBeenCalledWith(
-      {},
+      db,
       'schedule-1',
       'connection closed after request',
     );
     expect(releaseScheduledArticleMock).not.toHaveBeenCalled();
   });
+  it('keeps a budget refusal queued because no publish request was sent', async () => {
+    const error = new Error('X API budget reached'); error.name = 'BudgetExceededError';
+    const xClient = { publishArticle: vi.fn().mockRejectedValue(error) } as any;
+    await processScheduledArticles(db as any, xClient, 'account-1');
+    expect(releaseScheduledArticleMock).toHaveBeenCalledWith(db, 'schedule-1', 'X API budget reached');
+    expect(markScheduledArticleFailedMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves published state when usage accounting fails', async () => {
+    incrementApiUsageMock.mockRejectedValueOnce(new Error('accounting unavailable'));
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const xClient = { publishArticle: vi.fn().mockResolvedValue({ post_id: '2100000000000000000' }) } as any;
+    await processScheduledArticles(db as any, xClient, 'account-1');
+    expect(markScheduledArticlePublishedMock).toHaveBeenCalledOnce();
+    expect(markScheduledArticleFailedMock).not.toHaveBeenCalled();
+    expect(releaseScheduledArticleMock).not.toHaveBeenCalled();
+    errorLog.mockRestore();
+  });
+
 });

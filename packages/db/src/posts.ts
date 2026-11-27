@@ -14,6 +14,7 @@ export interface DbScheduledPost {
 }
 
 export async function createScheduledPost(db: D1Database, xAccountId: string, text: string, scheduledAt: string, mediaIds?: string[], quoteTweetId?: string): Promise<DbScheduledPost> {
+  scheduledAt = normalizeScheduledAt(scheduledAt);
   const id = crypto.randomUUID();
   const now = jstNow();
   const result = await db
@@ -23,14 +24,53 @@ export async function createScheduledPost(db: D1Database, xAccountId: string, te
   return result!;
 }
 
-export async function getScheduledPosts(db: D1Database, opts: { status?: string; xAccountId?: string } = {}): Promise<DbScheduledPost[]> {
+export const SCHEDULED_POST_STATUSES = ['scheduled', 'posted', 'failed'] as const;
+
+export async function getScheduledPosts(
+  db: D1Database,
+  opts: { status?: string; xAccountId?: string; limit?: number; offset?: number; newestFirst?: boolean } = {},
+): Promise<DbScheduledPost[]> {
   const conditions: string[] = [];
   const binds: unknown[] = [];
   if (opts.status) { conditions.push('status = ?'); binds.push(opts.status); }
   if (opts.xAccountId) { conditions.push('x_account_id = ?'); binds.push(opts.xAccountId); }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  const result = await db.prepare(`SELECT * FROM scheduled_posts ${where} ORDER BY scheduled_at ASC`).bind(...binds).all<DbScheduledPost>();
+  // History views (failed/posted/all) read newest first; the queue reads soonest first.
+  const order = opts.newestFirst ? 'ORDER BY scheduled_at DESC' : 'ORDER BY scheduled_at ASC';
+  let page = '';
+  if (opts.limit !== undefined) {
+    page = ' LIMIT ? OFFSET ?';
+    binds.push(opts.limit, opts.offset ?? 0);
+  }
+  const result = await db.prepare(`SELECT * FROM scheduled_posts ${where} ${order}${page}`).bind(...binds).all<DbScheduledPost>();
   return result.results;
+}
+
+export async function getScheduledPostById(db: D1Database, id: string): Promise<DbScheduledPost | null> {
+  return db.prepare('SELECT * FROM scheduled_posts WHERE id = ?').bind(id).first<DbScheduledPost>();
+}
+
+/**
+ * Put a FAILED post back in the queue at `scheduledAt`. Refuses rows with a
+ * posted_tweet_id (X accepted it — re-sending would duplicate). The failed
+ * attempt's send claim is released in the same batch, and only while the row
+ * is still a requeueable failure. Returns false when nothing was updated.
+ */
+export async function requeueFailedScheduledPost(db: D1Database, id: string, scheduledAt: string): Promise<boolean> {
+  const release = db
+    .prepare(
+      'DELETE FROM scheduled_post_claims WHERE post_id = ? AND EXISTS '
+        + "(SELECT 1 FROM scheduled_posts WHERE id = ? AND status = 'failed' AND posted_tweet_id IS NULL)",
+    )
+    .bind(id, id);
+  const update = db
+    .prepare(
+      "UPDATE scheduled_posts SET status = 'scheduled', scheduled_at = ?, updated_at = ? "
+        + "WHERE id = ? AND status = 'failed' AND posted_tweet_id IS NULL",
+    )
+    .bind(scheduledAt, jstNow(), id);
+  const [, res] = await db.batch([release, update]);
+  return (res.meta?.changes ?? 0) > 0;
 }
 
 const SLOT_CONFLICT_WINDOW_MS = 45 * 60_000;
@@ -57,7 +97,7 @@ export async function resolveFreeSlot(
   opts: { rollStale?: boolean } = {},
 ): Promise<string> {
   const requestedMs = parseScheduledAtMs(requestedAt);
-  if (Number.isNaN(requestedMs)) return requestedAt;
+  if (!Number.isFinite(requestedMs)) throw new Error('Invalid scheduledAt');
   let slotMs = requestedMs;
   if (opts.rollStale && slotMs <= Date.now()) slotMs = Date.now() + STALE_GRACE_MS;
   const taken = (await getScheduledPosts(db, { status: 'scheduled', xAccountId }))
@@ -67,13 +107,13 @@ export async function resolveFreeSlot(
     slotMs += SLOT_BUMP_MS;
   }
   // Untouched slot keeps its original string form (format contract with callers).
-  return slotMs === requestedMs ? requestedAt : toJstString(new Date(slotMs));
+  return toJstString(new Date(slotMs));
 }
 
 export async function getDueScheduledPosts(db: D1Database): Promise<DbScheduledPost[]> {
   const now = jstNow();
   const result = await db
-    .prepare("SELECT * FROM scheduled_posts WHERE status = 'scheduled' AND scheduled_at <= ? ORDER BY scheduled_at ASC")
+    .prepare("SELECT * FROM scheduled_posts WHERE status = 'scheduled' AND julianday(scheduled_at) <= julianday(?) AND NOT EXISTS (SELECT 1 FROM scheduled_post_claims WHERE post_id = scheduled_posts.id) ORDER BY julianday(scheduled_at) ASC")
     .bind(now)
     .all<DbScheduledPost>();
   return result.results;
@@ -89,4 +129,19 @@ export async function updateScheduledPostStatus(db: D1Database, id: string, stat
 
 export async function deleteScheduledPost(db: D1Database, id: string): Promise<void> {
   await db.prepare('DELETE FROM scheduled_posts WHERE id = ?').bind(id).run();
+}
+
+export function normalizeScheduledAt(value: string): string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})?$/.test(value)) throw new Error('Invalid scheduledAt');
+  const datePart=value.slice(0,10);
+  const dateCheck=new Date(`${datePart}T00:00:00Z`);
+  if(!Number.isFinite(dateCheck.getTime()) || dateCheck.toISOString().slice(0,10)!==datePart)throw new Error('Invalid scheduledAt');
+  const ms = parseScheduledAtMs(value);
+  if (!Number.isFinite(ms)) throw new Error('Invalid scheduledAt');
+  return toJstString(new Date(ms));
+}
+
+export async function claimScheduledPost(db: D1Database, id: string): Promise<boolean> {
+  const row = await db.prepare("INSERT OR IGNORE INTO scheduled_post_claims (post_id, claimed_at) SELECT id, ? FROM scheduled_posts WHERE id = ? AND status = 'scheduled' RETURNING post_id").bind(new Date().toISOString(), id).first();
+  return !!row;
 }

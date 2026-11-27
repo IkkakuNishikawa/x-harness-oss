@@ -27,10 +27,11 @@ export async function processScheduledArticles(
     try {
       const result = await xClient.publishArticle(claimed.article_id);
       await markScheduledArticlePublished(db, claimed.id, result.post_id);
-      await incrementApiUsage(db, xAccountId, 'article_publish');
+      await incrementApiUsage(db, xAccountId, 'article_publish').catch(error => console.error('Article usage accounting failed', error));
+      await Promise.resolve().then(() => db.prepare("UPDATE growth_articles SET status='published', published_article_id=?, updated_at=? WHERE x_article_draft_id=? AND x_account_id=?").bind(result.post_id, new Date().toISOString(), claimed.article_id, xAccountId).run()).catch(error => console.error('Article studio status update failed', error));
     } catch (error) {
       const message = errorText(error);
-      if (error instanceof XApiRateLimitError) {
+      if (error instanceof XApiRateLimitError || (error instanceof Error && error.name === 'BudgetExceededError')) {
         // A rate-limit response is known not to have published the Article.
         // Return it to the queue and retry on the next Cron tick.
         await releaseScheduledArticle(db, claimed.id, message);

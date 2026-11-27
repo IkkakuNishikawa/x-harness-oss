@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mockArticle: any = {
   id: 'art1',
@@ -25,6 +25,8 @@ const createGrowthArticleMock = vi.fn(async (_db: any, a: any) => ({
   source_tweet_ids: a.sourceTweetIds ?? null,
 }));
 
+const getActiveScheduledArticleMock = vi.fn(async () => null as any);
+
 const getGrowthArticlesMock = vi.fn(async () => [mockArticle]);
 
 const getGrowthArticleMock = vi.fn(async (_db: any, id: string) => ({
@@ -33,9 +35,13 @@ const getGrowthArticleMock = vi.fn(async (_db: any, id: string) => ({
 }));
 
 const updateGrowthArticleMock = vi.fn(async () => {});
+const updateIfUnchangedMock = vi.fn(async (..._a: any[]) => true);
 
 const setGrowthArticleStatusMock = vi.fn(async () => {});
 const setGrowthArticleXDraftIdMock = vi.fn(async () => {});
+const linkGrowthArticleXDraftIdMock = vi.fn(async () => true);
+const claimMock = vi.fn(async (): Promise<string | null> => 'creating:t');
+const settleMock = vi.fn(async () => {});
 const getXAccountByIdMock = vi.fn(async () => ({
   id: 'acc1',
   consumer_key: 'consumer-key',
@@ -58,16 +64,23 @@ vi.mock('@x-harness/x-sdk', async (importOriginal) => ({
   },
 }));
 
+vi.mock('../../services/x-client.js',()=>({buildXClient:async()=>({createArticleDraft:createArticleDraftMock,publishArticle:publishArticleMock,uploadMedia:uploadMediaMock})}));
+
 vi.mock('@x-harness/db', async (importOriginal) => ({
   ...(await importOriginal<any>()),
+  getActiveScheduledArticle: (...a: any[]) => (getActiveScheduledArticleMock as any)(...a),
   createGrowthArticle: (...a: any[]) => (createGrowthArticleMock as any)(...a),
   getGrowthArticles: (...a: any[]) => (getGrowthArticlesMock as any)(...a),
   getGrowthArticle: (...a: any[]) => (getGrowthArticleMock as any)(...a),
   updateGrowthArticle: (...a: any[]) => (updateGrowthArticleMock as any)(...a),
+  updateGrowthArticleIfUnchanged: (...a: any[]) => (updateIfUnchangedMock as any)(...a),
   getXAccountById: (...a: any[]) => (getXAccountByIdMock as any)(...a),
   incrementApiUsage: (...a: any[]) => (incrementApiUsageMock as any)(...a),
   setGrowthArticleXDraftId: (...a: any[]) => (setGrowthArticleXDraftIdMock as any)(...a),
   setGrowthArticleStatus: (...a: any[]) => (setGrowthArticleStatusMock as any)(...a),
+  linkGrowthArticleXDraftId: (...a: any[]) => (linkGrowthArticleXDraftIdMock as any)(...a),
+  claimGrowthArticleXDraft: (...a: any[]) => (claimMock as any)(...a),
+  settleGrowthArticleXDraftClaim: (...a: any[]) => (settleMock as any)(...a),
 }));
 
 import { growthArticles } from '../growth-articles.js';
@@ -78,6 +91,7 @@ describe('/api/growth/articles routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getGrowthArticleMock.mockResolvedValue({ ...mockArticle });
+    claimMock.mockResolvedValue('creating:t');
     createArticleDraftMock.mockResolvedValue({ id: 'x-draft-1', title: 'Test Article' });
     publishArticleMock.mockResolvedValue({ post_id: 'post-123' });
   });
@@ -197,7 +211,7 @@ describe('/api/growth/articles routes', () => {
       title: 'Test Article',
       content_state: expect.objectContaining({ blocks: expect.any(Array) }),
     }));
-    expect(setGrowthArticleXDraftIdMock).toHaveBeenCalledWith({}, 'art1', 'x-draft-1');
+    expect(settleMock).toHaveBeenCalledWith({}, 'art1', 'creating:t', 'x-draft-1');
     expect(publishArticleMock).toHaveBeenCalledWith('x-draft-1');
     expect(setGrowthArticleStatusMock).toHaveBeenCalledWith({}, 'art1', 'published', 'post-123');
     expect(incrementApiUsageMock).toHaveBeenCalledWith({}, 'acc1', 'article_draft');
@@ -206,6 +220,69 @@ describe('/api/growth/articles routes', () => {
       success: true,
       data: { article_id: 'x-draft-1', post_id: 'post-123' },
     });
+  });
+
+  it('aborts with 400 before creating a draft when an inline image fails (one-shot publish)', async () => {
+    getGrowthArticleMock.mockResolvedValueOnce({
+      ...mockArticle,
+      body_md: '本文\n\n![ok](https://w.test/api/growth/img/ok.png)\n\n![ng](https://w.test/api/growth/img/missing.png)\n\n[リンク](https://example.com)',
+    });
+    const r2 = {
+      get: vi.fn(async (key: string) =>
+        key === 'growth/ok.png'
+          ? { arrayBuffer: async () => new ArrayBuffer(4), httpMetadata: { contentType: 'image/png' } }
+          : null,
+      ),
+    };
+    const req = new Request('http://local/api/growth/articles/art1/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    const res = await growthArticles.request(req, undefined, { DB: {}, WORKER_URL: 'https://w.test', GROWTH_IMAGES: r2 } as any);
+
+    expect(res.status).toBe(400);
+    expect(createArticleDraftMock).not.toHaveBeenCalled();
+    expect(publishArticleMock).not.toHaveBeenCalled();
+    const json = (await res.json()) as any;
+    expect(json.error).toMatch(/missing\.png/);
+  });
+
+  it('converts links and images into entities on the publish path', async () => {
+    getGrowthArticleMock.mockResolvedValueOnce({
+      ...mockArticle,
+      body_md: '本文\n\n![ok](https://w.test/api/growth/img/ok.png)\n\n[リンク](https://example.com)',
+    });
+    const r2 = {
+      get: vi.fn(async () => ({ arrayBuffer: async () => new ArrayBuffer(4), httpMetadata: { contentType: 'image/png' } })),
+    };
+    const req = new Request('http://local/api/growth/articles/art1/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    const res = await growthArticles.request(req, undefined, { DB: {}, WORKER_URL: 'https://w.test', GROWTH_IMAGES: r2 } as any);
+
+    expect(res.status).toBe(200);
+    const cs = (createArticleDraftMock.mock.calls[0] as any[])[0].content_state;
+    expect(cs.entities.map((e: any) => e.value.type)).toEqual(['image', 'link']);
+    expect(cs.entities[0].value.data.media_items).toEqual([{ media_id: 'media-123', media_category: 'tweet_image' }]);
+  });
+
+  it('rejects with 400 before spending the draft window when markdown blocks exceed the weighted cap', async () => {
+    getGrowthArticleMock.mockResolvedValueOnce({
+      ...mockArticle,
+      body_md: '```\n' + 'あ'.repeat(5001) + '\n```',
+    });
+    const req = new Request('http://local/api/growth/articles/art1/publish', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    const res = await growthArticles.request(req, undefined, env);
+    expect(res.status).toBe(400);
+    expect(createArticleDraftMock).not.toHaveBeenCalled();
+    expect(publishArticleMock).not.toHaveBeenCalled();
   });
 
   it('retries publishing the saved X draft without creating a duplicate', async () => {
@@ -233,7 +310,7 @@ describe('/api/growth/articles routes', () => {
     const res = await growthArticles.request(req, undefined, env);
 
     expect(res.status).toBe(500);
-    expect(setGrowthArticleXDraftIdMock).toHaveBeenCalledWith({}, 'art1', 'x-draft-1');
+    expect(settleMock).toHaveBeenCalledWith({}, 'art1', 'creating:t', 'x-draft-1');
     expect(setGrowthArticleStatusMock).not.toHaveBeenCalled();
     expect(await res.json()).toMatchObject({ success: false, error: 'Premium required' });
   });
@@ -265,5 +342,201 @@ describe('/api/growth/articles routes', () => {
     const body = await res.json() as any;
     expect(body.success).toBe(true);
     expect(setGrowthArticleStatusMock).toHaveBeenCalledWith({}, 'art1', 'discarded');
+  });
+});
+
+describe('article studio safeguards', () => {
+  beforeEach(() => { vi.clearAllMocks(); getGrowthArticleMock.mockResolvedValue({ ...mockArticle }); });
+  it('filters the repository query by selected account', async () => {
+    const res = await growthArticles.request('http://local/api/growth/articles?xAccountId=acc2', {}, env);
+    expect(res.status).toBe(200);
+    expect(getGrowthArticlesMock).toHaveBeenCalledWith({}, { status: undefined, xAccountId: 'acc2' });
+  });
+  it('rejects blank source content without saving it', async () => {
+    const res = await growthArticles.request('http://local/api/growth/articles', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ xAccountId: 'acc1', title: ' ', bodyMd: 'body' }),
+    }, env);
+    expect(res.status).toBe(400);
+    expect(createGrowthArticleMock).not.toHaveBeenCalled();
+  });
+  it('does not edit an X draft that would publish the old remote content', async () => {
+    getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle, x_article_draft_id: 'remote1' });
+    const res = await growthArticles.request('http://local/api/growth/articles/art1', {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ bodyMd: 'new content' }),
+    }, env);
+    expect(res.status).toBe(409);
+    expect(updateGrowthArticleMock).not.toHaveBeenCalled();
+  });
+  it('rejects empty edits', async () => {
+    const res = await growthArticles.request('http://local/api/growth/articles/art1', {
+      method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: '' }),
+    }, env);
+    expect(res.status).toBe(400);
+    expect(updateGrowthArticleMock).not.toHaveBeenCalled();
+  });
+
+  describe('harness image import + X draft linkage', () => {
+    const WORKER = 'https://xh.example.workers.dev';
+    const drive = (id: string) => `https://drive.google.com/uc?export=download&id=${id}`;
+    const bucket = () => ({ put: vi.fn(async () => {}) });
+    let fetchSpy: any;
+    beforeEach(() => {
+      fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+        new Response(new Uint8Array(4), { headers: { 'content-type': 'image/png' } }));
+    });
+    afterEach(() => fetchSpy.mockRestore());
+
+    it('POST imports external cover/body images into harness storage', async () => {
+      const b = bucket();
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ xAccountId: 'acc1', title: 'T', bodyMd: `hi\n\n![a](${drive('a')})`, imageUrl: drive('c') }),
+      }), undefined, { DB: {}, WORKER_URL: WORKER, GROWTH_IMAGES: b } as any);
+      expect(res.status).toBe(201);
+      const json = await res.json() as any;
+      expect(json.imageImport).toEqual({ imported: 2, failed: [] });
+      const saved = createGrowthArticleMock.mock.calls[0][1];
+      expect(saved.imageUrl).toMatch(/^https:\/\/xh\.example\.workers\.dev\/api\/growth\/img\/.+\.png$/);
+      expect(saved.bodyMd).not.toContain('drive.google.com');
+      expect(b.put).toHaveBeenCalledTimes(2);
+    });
+
+    it('PATCH imports images in the fields it changes', async () => {
+      getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle }).mockResolvedValueOnce({ ...mockArticle });
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1', {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ bodyMd: `![a](${drive('a')})` }),
+      }), undefined, { DB: {}, WORKER_URL: WORKER, GROWTH_IMAGES: bucket() } as any);
+      expect(res.status).toBe(200);
+      const patch = (updateGrowthArticleMock.mock.calls[0] as any[])[2];
+      expect(patch.bodyMd).toMatch(/\/api\/growth\/img\//);
+      expect(patch.imageUrl).toBeUndefined();
+    });
+
+    it('import-images rewrites a stored draft and is refused once an X draft exists', async () => {
+      getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle, image_url: drive('c'), body_md: `![a](${drive('a')})` });
+      const env2 = { DB: {}, WORKER_URL: WORKER, GROWTH_IMAGES: bucket() } as any;
+      const ok = await growthArticles.request(new Request('http://local/api/growth/articles/art1/import-images', { method: 'POST' }), undefined, env2);
+      expect(ok.status).toBe(200);
+      const call = updateIfUnchangedMock.mock.calls.at(-1) as any[];
+      expect(call[2]).toBe(mockArticle.updated_at);
+      const patch = call[3];
+      expect(patch.imageUrl).toMatch(/\/api\/growth\/img\//);
+      expect(patch.bodyMd).toMatch(/\/api\/growth\/img\//);
+
+      // an edit saved during the download wins: the import reports a conflict
+      updateIfUnchangedMock.mockResolvedValueOnce(false);
+      getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle, image_url: drive('d') });
+      const raced = await growthArticles.request(new Request('http://local/api/growth/articles/art1/import-images', { method: 'POST' }), undefined, env2);
+      expect(raced.status).toBe(409);
+
+      getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle, x_article_draft_id: '123' });
+      const frozen = await growthArticles.request(new Request('http://local/api/growth/articles/art1/import-images', { method: 'POST' }), undefined, env2);
+      expect(frozen.status).toBe(409);
+    });
+
+    it('POST x-draft creates the X draft without publishing', async () => {
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', { method: 'POST' }), undefined, env);
+      expect(res.status).toBe(201);
+      expect(await res.json()).toMatchObject({ success: true, data: { x_article_draft_id: 'x-draft-1', created: true } });
+      expect(settleMock).toHaveBeenCalledWith({}, 'art1', 'creating:t', 'x-draft-1');
+      expect(publishArticleMock).not.toHaveBeenCalled();
+    });
+
+    it('POST x-draft is idempotent when a draft is already linked', async () => {
+      getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle, x_article_draft_id: '999' });
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', { method: 'POST' }), undefined, env);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ data: { x_article_draft_id: '999', created: false } });
+      expect(createArticleDraftMock).not.toHaveBeenCalled();
+    });
+
+    it('PUT x-draft links an externally created draft id', async () => {
+      getGrowthArticleMock
+        .mockResolvedValueOnce({ ...mockArticle })
+        .mockResolvedValueOnce({ ...mockArticle, x_article_draft_id: '1000000000000000001' });
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ xArticleDraftId: '1000000000000000001' }),
+      }), undefined, env);
+      expect(res.status).toBe(200);
+      expect(linkGrowthArticleXDraftIdMock).toHaveBeenCalledWith({}, 'art1', '1000000000000000001');
+      expect(createArticleDraftMock).not.toHaveBeenCalled();
+      expect(publishArticleMock).not.toHaveBeenCalled();
+    });
+
+    it('PUT x-draft validates the id and refuses to replace another draft', async () => {
+      const bad = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ xArticleDraftId: 'abc' }),
+      }), undefined, env);
+      expect(bad.status).toBe(400);
+      getGrowthArticleMock.mockResolvedValueOnce({ ...mockArticle, x_article_draft_id: '111' });
+      const conflict = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ xArticleDraftId: '222' }),
+      }), undefined, env);
+      expect(conflict.status).toBe(409);
+      expect(linkGrowthArticleXDraftIdMock).not.toHaveBeenCalled();
+    });
+
+    it('serves stored images with nosniff and long cache', async () => {
+      const get = vi.fn(async () => ({ body: 'x', httpMetadata: { contentType: 'image/jpeg' } }));
+      const res = await growthArticles.request(new Request('http://local/api/growth/img/abc.jpg'), undefined, { DB: {}, GROWTH_IMAGES: { get } } as any);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toBe('image/jpeg');
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(get).toHaveBeenCalledWith('growth/abc.jpg');
+    });
+  });
+
+  describe('X draft creation claim', () => {
+    it('refuses to create when another request holds the claim', async () => {
+      claimMock.mockResolvedValueOnce(null);
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', { method: 'POST' }), undefined, env);
+      expect(res.status).toBe(409);
+      expect(createArticleDraftMock).not.toHaveBeenCalled();
+    });
+
+    it('releases the claim when X draft creation fails', async () => {
+      createArticleDraftMock.mockRejectedValueOnce(new Error('boom'));
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', { method: 'POST' }), undefined, env);
+      expect(res.status).toBe(500);
+      expect(settleMock).toHaveBeenCalledWith({}, 'art1', 'creating:t', null);
+    });
+
+    it('reports an in-progress claim as 409 for x-draft and publish', async () => {
+      getGrowthArticleMock.mockResolvedValue({ ...mockArticle, x_article_draft_id: `creating:${new Date().toISOString()}` });
+      const a = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', { method: 'POST' }), undefined, env);
+      const b = await growthArticles.request(new Request('http://local/api/growth/articles/art1/publish', { method: 'POST', body: '{}' }), undefined, env);
+      expect(a.status).toBe(409);
+      expect(b.status).toBe(409);
+      expect(publishArticleMock).not.toHaveBeenCalled();
+    });
+
+    it('keeps content editable under an expired claim but frozen under an active one', async () => {
+      const patch = () => growthArticles.request(new Request('http://local/api/growth/articles/art1', {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'new title' }),
+      }), undefined, env);
+      getGrowthArticleMock.mockResolvedValue({ ...mockArticle, x_article_draft_id: 'creating:2026-01-01T00:00:00.000Z' });
+      expect((await patch()).status).toBe(200);
+      getGrowthArticleMock.mockResolvedValue({ ...mockArticle, x_article_draft_id: `creating:${new Date().toISOString()}` });
+      expect((await patch()).status).toBe(409);
+    });
+
+    it('lets an expired claim (crashed request) be retried', async () => {
+      getGrowthArticleMock.mockResolvedValue({ ...mockArticle, x_article_draft_id: 'creating:2026-01-01T00:00:00.000Z' });
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/art1/x-draft', { method: 'POST' }), undefined, env);
+      expect(res.status).toBe(201);
+      expect(claimMock).toHaveBeenCalled();
+      expect(createArticleDraftMock).toHaveBeenCalled();
+    });
+
+    it('accepts untyped multipart uploads as PNG (pipeline compatibility)', async () => {
+      const put = vi.fn(async () => {});
+      const fd = new FormData();
+      fd.append('file', new Blob([new Uint8Array(3)]), 'x');
+      const res = await growthArticles.request(new Request('http://local/api/growth/articles/image', { method: 'POST', body: fd }), undefined, { DB: {}, WORKER_URL: 'https://xh.dev', GROWTH_IMAGES: { put } } as any);
+      expect(res.status).toBe(201);
+      expect((await res.json() as any).data.url).toMatch(/^https:\/\/xh\.dev\/api\/growth\/img\/.+\.png$/);
+    });
   });
 });

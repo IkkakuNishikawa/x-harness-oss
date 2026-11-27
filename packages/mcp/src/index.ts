@@ -8,7 +8,7 @@ import { postToolDefs } from './tools/posts.js';
 import { engagementToolDefs } from './tools/engagement.js';
 import { userToolDefs } from './tools/users.js';
 import { dmToolDefs } from './tools/dm.js';
-import { gateToolDefs } from './tools/gates.js';
+import { gateToolDefs, externalSourceToolDefs } from './tools/gates.js';
 import { stepToolDefs } from './tools/steps.js';
 import { analyticsToolDefs } from './tools/analytics.js';
 import { staffToolDefs } from './tools/staff.js';
@@ -25,19 +25,22 @@ const API_KEY = process.env.X_HARNESS_API_KEY ?? '';
 
 const client = new XHarnessClient(API_URL, API_KEY);
 
+const aiToolDefs=['digest','research','drafts','triage','best-times'].map(feature=>({name:`ai_${feature.replace('-','_')}`,description:`Grok ${feature} (optional BYO key; budget applies, never sends posts)`,inputSchema:{type:'object' as const,properties:{xAccountId:{type:'string'},theme:{type:'string'},handles:{type:'array',items:{type:'string'},maxItems:20},keywords:{type:'array',items:{type:'string'}},tweetIds:{type:'array',items:{type:'string'},maxItems:100},days:{type:'integer',minimum:1,maximum:30}},required:['xAccountId']}}));
 const allTools = [
+  ...aiToolDefs,
   ...postToolDefs,
   ...engagementToolDefs,
   ...userToolDefs,
   ...dmToolDefs,
   ...gateToolDefs,
+  ...externalSourceToolDefs,
   ...stepToolDefs,
   ...analyticsToolDefs,
   ...staffToolDefs,
   ...campaignToolDefs,
   ...usageToolDefs,
   ...articleToolDefs,
-  ...scrapeToolDefs,
+  ...(process.env.X_HARNESS_ENABLE_SCRAPER === 'true' ? scrapeToolDefs : []),
   ...growthToolDefs,
 ];
 
@@ -51,6 +54,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   const a = (args ?? {}) as Record<string, any>;
   try {
+    if(name.startsWith('ai_')) {
+      if(!aiToolDefs.some(t=>t.name===name)) throw new Error('Unknown AI tool');
+      const result=await client.post(`/api/ai/${name.slice(3).replace('_','-')}`,a);
+      return {content:[{type:'text',text:JSON.stringify(result)}]};
+    }
+    if(name.startsWith('scrape_') && process.env.X_HARNESS_ENABLE_SCRAPER !== 'true') throw new Error('Scraper is disabled; use ai_research');
     let result: any;
     switch (name) {
       case 'create_post':
@@ -128,7 +137,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await client.del(`/api/posts/${a.tweetId}?xAccountId=${encodeURIComponent(a.xAccountId)}`);
         break;
       case 'get_post':
-        result = await client.get(`/api/posts/${a.tweetId}`);
+        result = await client.get(`/api/posts/${encodeURIComponent(a.tweetId)}${a.xAccountId ? `?xAccountId=${encodeURIComponent(a.xAccountId)}` : ''}`);
         break;
       case 'search_posts':
         result = await client.get(`/api/posts/search?query=${encodeURIComponent(a.query)}`);
@@ -150,7 +159,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await client.get(`/api/users/lookup?${a.username ? `username=${a.username}` : `userId=${a.userId}`}`);
         break;
       case 'search_users':
-        result = await client.get(`/api/users/search?query=${encodeURIComponent(a.query)}`);
+        result = await client.get(`/api/users/search?q=${encodeURIComponent(a.query)}`);
         break;
       case 'get_followers':
         result = await client.get(`/api/followers?xAccountId=${a.xAccountId}`);
@@ -184,6 +193,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ...(a.expiresAfterHours !== undefined ? { expiresAfterHours: a.expiresAfterHours } : {}),
         });
         break;
+      case 'external_gate_sources':
+        result=await client.get('/api/integrations/agent-source/gates');break;
+      case 'external_gate_scan_start':
+        if(!/^[a-zA-Z0-9_-]{1,128}$/.test(a.gateId??''))throw new Error('invalid_gate');
+        result=await client.post(`/api/integrations/agent-source/${a.gateId}/scan`,{});break;
+      case 'external_gate_page_import': {
+        if(!/^[a-zA-Z0-9_-]{1,128}$/.test(a.gateId??''))throw new Error('invalid_gate');
+        const {gateId,...page}=a;result=await client.post(`/api/integrations/agent-source/${gateId}/page`,page);break;
+      }
       case 'list_engagement_gates':
         result = await client.get('/api/engagement-gates');
         break;
@@ -209,7 +227,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await client.get(`/api/step-sequences${a.xAccountId ? `?xAccountId=${a.xAccountId}` : ''}`);
         break;
       case 'get_post_metrics':
-        result = await client.get(`/api/posts/${a.tweetId}/metrics`);
+        result = await client.get(`/api/posts/${encodeURIComponent(a.tweetId)}/metrics${a.xAccountId ? `?xAccountId=${encodeURIComponent(a.xAccountId)}` : ''}`);
         break;
       case 'get_gate_analytics':
         result = await client.get(`/api/engagement-gates/${a.gateId}/analytics`);
@@ -236,29 +254,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'delete_staff':
         result = await client.del(`/api/staff/${encodeURIComponent(a.id)}`);
         break;
-      case 'create_campaign': {
-        const conditions = a.conditions ?? {};
-        const gatePayload: Record<string, any> = {
-          xAccountId: a.xAccountId,
-          postId: a.postId,
-          triggerType: 'reply',
-          actionType: 'verify_only',
-          template: '',
-          ...(conditions.requireLike !== undefined ? { requireLike: conditions.requireLike } : {}),
-          ...(conditions.requireRepost !== undefined ? { requireRepost: conditions.requireRepost } : {}),
-          ...(a.lineHarnessUrl ? { lineHarnessUrl: a.lineHarnessUrl } : {}),
-          ...(a.lineHarnessApiKey ? { lineHarnessApiKey: a.lineHarnessApiKey } : {}),
-          ...(a.formId ? { formId: a.formId } : {}),
-          ...(a.ref ? { ref: a.ref } : {}),
+      case 'get_campaign_digest':
+        result = await client.get(`/api/campaigns/${encodeURIComponent(a.gateId)}/digest`);
+        break;
+      case 'get_campaign_status':
+        result = await client.get(`/api/campaigns/${encodeURIComponent(a.gateId)}/status`);
+        break;
+      case 'get_cost_forecast': {
+        const forecast = await client.get('/api/usage/spend');
+        const query = new URLSearchParams();
+        for (const k of ['tier', 'expectedReplies', 'quota', 'verifyFollow', 'days'])
+          if (a[k] !== undefined) query.set(k, String(a[k]));
+        result = {
+          forecast,
+          ...(query.size ? { estimate: await client.get('/api/campaigns/estimate?' + query) } : {}),
         };
-        const gate = await client.post<{ id: string }>('/api/engagement-gates', gatePayload);
-        const lineBase = (a.lineHarnessUrl || process.env.LINE_HARNESS_URL || '').replace(/\/$/, '');
-        const campaignLink = a.ref && lineBase
-          ? `${lineBase}/r/${encodeURIComponent(a.ref)}${a.formId ? `?form=${encodeURIComponent(a.formId)}` : ''}`
-          : null;
-        result = { gate, campaignLink };
         break;
       }
+      case 'draft_campaign':
+        result = await client.post('/api/campaigns/draft', a);
+        break;
+      case 'create_campaign':
+        result=await client.post('/api/campaigns',{...a,mode:'line_first'});
+        break;
+      case 'get_gate_funnel':
+        result=await client.get(`/api/engagement-gates/${encodeURIComponent(a.gateId)}/funnel`);
+        break;
       case 'get_usage_summary': {
         const qs = new URLSearchParams();
         if (a.xAccountId) qs.set('xAccountId', a.xAccountId);
