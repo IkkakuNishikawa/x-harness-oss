@@ -198,6 +198,7 @@ app.put('/api/settings', async (c) => {
     'ai_watch_handles',
     'ai_keywords',
     'ai_digest_enabled',
+    'follower_snapshots_enabled',
   ]);
   if (
     Object.entries(body).some(
@@ -430,7 +431,7 @@ async function scheduled(
           new EngagementCache(undefined, env.DB),
           env.ENCRYPTION_KEY,
         );
-      if (!(await hasSnapshotForToday(env.DB, account.id))) {
+      if ((await getSettingBool(env.DB, 'follower_snapshots_enabled', false)) && !(await hasSnapshotForToday(env.DB, account.id))) {
         const client = await buildXClient(env, account, 'snapshot');
         const me = await client.getMe();
         if (me.public_metrics)

@@ -4,7 +4,7 @@ import { createScheduledArticle, getDueScheduledArticles, claimScheduledArticle,
 import { processScheduledArticles } from '../../apps/worker/src/services/article-scheduler.js';
 import worker from '../../apps/worker/src/index.js';
 
-afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 describe('article scheduling with real SQLite', () => {
   it('compares actual instants across offsets and scopes due articles by account', async () => {
     const { db } = fixture();
@@ -46,6 +46,17 @@ describe('article scheduling with real SQLite', () => {
       method: 'POST', headers: { Authorization: 'Bearer master-key', 'Content-Type': 'application/json' }, body: JSON.stringify({ xAccountId: 'a' }),
     }), { DB: db, API_KEY: 'master-key' } as any, { waitUntil() {} } as any);
     expect(response.status).toBe(409);
+  });
+
+  it('idle cron makes no external API calls with optional paid tracking disabled', async () => {
+    const { db, sqlite } = fixture();
+    sqlite.exec("UPDATE engagement_gates SET is_active=0; INSERT INTO settings(key,value,updated_at) VALUES ('auto_features_enabled','true','now')");
+    const externalFetch = vi.fn().mockRejectedValue(new Error('unexpected billable API call'));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubGlobal('fetch', externalFetch);
+    await worker.scheduled({ scheduledTime: Date.now() } as any, { DB: db } as any, {} as any);
+    expect(errors).not.toHaveBeenCalled();
+    expect(externalFetch).not.toHaveBeenCalled();
   });
 
 });

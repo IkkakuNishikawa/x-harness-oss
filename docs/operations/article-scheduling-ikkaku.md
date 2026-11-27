@@ -21,3 +21,7 @@ Existing installs require a schema audit and backup. Apply only missing historic
 ## Validation
 
 Unit/SQLite integration coverage includes instant comparisons across timezones, account filtering, uniqueness, overlapping claims, cancellation guards, authentication/roles, budget refusal, ambiguous send failures, usage-accounting failure and immediate-publication guards. Production smoke checks register a fictitious draft for 2099, confirm duplicate rejection/listing, then cancel it. No real X article is created or published by these checks.
+
+## Idle cost control
+
+Daily follower snapshot polling is opt-in (`follower_snapshots_enabled`, default false). With no due schedules, active gates, enrolled steps, or queued integrations, Cron makes no external X/AI/LINE calls. The settings screen labels follower polling as billable and unnecessary for scheduling. Grok digest remains opt-in and no AI key is provisioned by this upgrade. The application monthly X budget is a stop threshold, not a subscription fee or a provider-enforced hard cap.
