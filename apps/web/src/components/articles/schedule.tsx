@@ -67,7 +67,7 @@ export default function ArticleSchedule({ accountId, savedArticle, onDraftCreate
         <Button disabled={busy || !datetime || !/^\d+$/.test(articleId)} onClick={() => schedule(false)}>このX下書きを予約する</Button></div>
     </details>
     <div className="flex items-center justify-between"><h3 className="text-sm font-semibold">予約・公開履歴</h3><Button disabled={busy} onClick={() => void run(load)}>更新</Button></div>
-    {items.length === 0 ? <p className="text-sm text-kumo-subtle">予約はありません。</p> : <ul className="space-y-3">{items.map(item => <li key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-t border-kumo-line pt-3 text-sm">
+    {items.length === 0 ? <p className="text-sm text-kumo-subtle">予約はありません。</p> : <ul className="max-h-64 space-y-3 overflow-y-auto pr-1">{items.map(item => <li key={item.id} className="flex flex-wrap items-center justify-between gap-3 border-t border-kumo-line pt-3 text-sm">
       <div><p>{new Date(item.scheduledAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })} · {labels[item.status] ?? item.status}</p><p className="break-all text-xs text-kumo-subtle">記事ID: {item.articleId}</p>{item.lastError && <p className="text-kumo-danger">{item.lastError}</p>}{item.publishedPostId && <a className="underline" href={`https://x.com/i/status/${encodeURIComponent(item.publishedPostId)}`} target="_blank" rel="noopener noreferrer">公開記事を見る</a>}</div>
       {item.status === 'scheduled' && <Button disabled={busy} onClick={() => {
         if (window.confirm('この公開予約を取り消しますか？X下書きは残ります。')) void run(async () => {
